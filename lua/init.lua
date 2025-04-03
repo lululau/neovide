@@ -40,6 +40,13 @@ local function get_clipboard(register)
     end
 end
 
+-- Quit when Command+Q is pressed on macOS
+if vim.fn.has("macunix") then
+    vim.keymap.set({ "n", "i", "c", "v", "o", "t", "l" }, "<D-q>", function()
+        rpcnotify("neovide.exec_detach_handler")
+    end)
+end
+
 if args.register_clipboard and not vim.g.neovide_no_custom_clipboard then
     vim.g.clipboard = {
         name = "neovide",
@@ -70,13 +77,13 @@ vim.api.nvim_create_user_command("NeovideFocus", function()
     rpcnotify("neovide.focus_window")
 end, {})
 
-vim.api.nvim_exec(
+vim.api.nvim_exec2(
     [[
 function! WatchGlobal(variable, callback)
     call dictwatcheradd(g:, a:variable, a:callback)
 endfunction
 ]],
-    false
+    { output = false }
 )
 
 for _, global_variable_setting in ipairs(args.global_variable_settings) do
@@ -125,7 +132,8 @@ M.private.dropfile = function(filename, tabs)
     vim.api.nvim_cmd({
         cmd = "drop",
         args = { vim.fn.fnameescape(filename) },
-        mods = { tab = tabs and 1 or 0 },
+        -- Always open as the last tabpage
+        mods = tabs and { tab = #vim.api.nvim_list_tabpages() } or {},
     }, {})
 end
 

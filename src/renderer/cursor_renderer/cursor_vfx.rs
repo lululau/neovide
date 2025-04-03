@@ -20,6 +20,7 @@ pub trait CursorVfx {
         dt: f32,
     ) -> bool;
     fn restart(&mut self, position: PixelPos<f32>);
+    fn cursor_jumped(&mut self, position: PixelPos<f32>);
     fn render(
         &self,
         settings: &CursorSettings,
@@ -50,6 +51,9 @@ pub enum VfxMode {
     Disabled,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
+pub struct VfxModeList(Vec<VfxMode>);
+
 impl ParseFromValue for VfxMode {
     fn parse_from_value(&mut self, value: Value) {
         if value.is_str() {
@@ -72,6 +76,35 @@ impl ParseFromValue for VfxMode {
     }
 }
 
+impl ParseFromValue for VfxModeList {
+    fn parse_from_value(&mut self, value: Value) {
+        self.0.clear();
+        if value.is_str() {
+            let mut vfx_mode = VfxMode::Disabled;
+            vfx_mode.parse_from_value(value);
+            self.0.push(vfx_mode);
+        } else if value.is_array() {
+            for item in value.as_array().unwrap() {
+                if item.is_str() {
+                    let mut vfx_mode = VfxMode::Disabled;
+                    vfx_mode.parse_from_value(item.clone());
+                    self.0.push(vfx_mode);
+                } else {
+                    error!(
+                        "Expected a VfxMode string in the array, but received {:?}",
+                        item
+                    );
+                }
+            }
+        } else {
+            error!(
+                "Expected a string or an array of VfxMode strings, but received {:?}",
+                value
+            );
+        }
+    }
+}
+
 impl From<VfxMode> for Value {
     fn from(mode: VfxMode) -> Self {
         match mode {
@@ -86,12 +119,30 @@ impl From<VfxMode> for Value {
     }
 }
 
-pub fn new_cursor_vfx(mode: &VfxMode) -> Option<Box<dyn CursorVfx>> {
-    match mode {
-        VfxMode::Highlight(mode) => Some(Box::new(PointHighlight::new(mode))),
-        VfxMode::Trail(mode) => Some(Box::new(ParticleTrail::new(mode))),
-        VfxMode::Disabled => None,
+impl From<VfxModeList> for Value {
+    fn from(modes: VfxModeList) -> Self {
+        let mut values = Vec::new();
+
+        for mode in modes.0 {
+            values.push(Value::from(mode));
+        }
+
+        Value::from(values)
     }
+}
+
+pub fn new_cursor_vfxs(modes: &VfxModeList) -> Vec<Box<dyn CursorVfx>> {
+    modes
+        .0
+        .iter()
+        .filter_map(|mode| match mode {
+            VfxMode::Highlight(mode) => {
+                Some(Box::new(PointHighlight::new(mode)) as Box<dyn CursorVfx>)
+            }
+            VfxMode::Trail(mode) => Some(Box::new(ParticleTrail::new(mode)) as Box<dyn CursorVfx>),
+            VfxMode::Disabled => None,
+        })
+        .collect()
 }
 
 pub struct PointHighlight {
@@ -113,19 +164,28 @@ impl PointHighlight {
 impl CursorVfx for PointHighlight {
     fn update(
         &mut self,
-        _settings: &CursorSettings,
-        _current_cursor_destination: PixelPos<f32>,
+        settings: &CursorSettings,
+        current_cursor_destination: PixelPos<f32>,
         _cursor_dimensions: PixelSize<f32>,
         _immediate_movement: bool,
         dt: f32,
     ) -> bool {
-        self.t = (self.t + dt * 5.0).min(1.0); // TODO - speed config
+        self.center_position = current_cursor_destination;
+        if settings.vfx_particle_highlight_lifetime > 0.0 {
+            self.t = (self.t + dt * (1.0 / settings.vfx_particle_highlight_lifetime)).min(1.0);
+        } else {
+            self.t = 1.0
+        }
         self.t < 1.0
     }
 
     fn restart(&mut self, position: PixelPos<f32>) {
         self.t = 0.0;
         self.center_position = position;
+    }
+
+    fn cursor_jumped(&mut self, position: PixelPos<f32>) {
+        self.restart(position);
     }
 
     fn render(
@@ -191,6 +251,7 @@ pub struct ParticleTrail {
     previous_cursor_dest: PixelPos<f32>,
     trail_mode: TrailMode,
     rng: RngState,
+    count_reminder: f32,
 }
 
 impl ParticleTrail {
@@ -200,6 +261,7 @@ impl ParticleTrail {
             previous_cursor_dest: PixelPos::new(0.0, 0.0),
             trail_mode: trail_mode.clone(),
             rng: RngState::new(),
+            count_reminder: 0.0,
         }
     }
 
@@ -260,14 +322,17 @@ impl CursorVfx for ParticleTrail {
                 let travel_distance = travel.length();
 
                 // Increase amount of particles when cursor travels further
-                let particle_count = ((travel_distance / cursor_dimensions.height).powf(1.5)
-                    * settings.vfx_particle_density
-                    * 0.01) as usize;
+                let f_particle_count = ((travel_distance / cursor_dimensions.height)
+                    * settings.vfx_particle_density)
+                    + self.count_reminder;
+
+                let particle_count = f_particle_count as usize;
+                self.count_reminder = f_particle_count - particle_count as f32;
 
                 let prev_p = self.previous_cursor_dest;
 
                 for i in 0..particle_count {
-                    let t = i as f32 / (particle_count as f32);
+                    let t = ((i + 1) as f32) / (particle_count as f32);
 
                     let speed = match self.trail_mode {
                         TrailMode::Railgun => {
@@ -325,7 +390,11 @@ impl CursorVfx for ParticleTrail {
         !self.particles.is_empty()
     }
 
-    fn restart(&mut self, _position: PixelPos<f32>) {}
+    fn restart(&mut self, _position: PixelPos<f32>) {
+        self.count_reminder = 0.0;
+    }
+
+    fn cursor_jumped(&mut self, _position: PixelPos<f32>) {}
 
     fn render(
         &self,

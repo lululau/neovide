@@ -24,7 +24,6 @@ pub use window_size::{
 
 mod config;
 pub use config::{Config, HotReloadConfigs};
-pub use font::FontSettings;
 
 pub trait SettingGroup {
     type ChangedEvent: Debug + Clone + Send + Sync + Any;
@@ -327,8 +326,7 @@ mod tests {
         //create_nvim_command tries to read from CmdLineSettings.neovim_args
         settings.set::<CmdLineSettings>(&CmdLineSettings::default());
 
-        let command = create_nvim_command(&settings)
-            .unwrap_or_explained_panic("Could not create nvim command");
+        let command = create_nvim_command(&settings);
         let instance = NeovimInstance::Embedded(command);
         let NeovimSession { neovim: nvim, .. } = NeovimSession::new(instance, NeovimHandler())
             .await
