@@ -53,7 +53,7 @@ impl SerialCommand {
         log::trace!("In Serial Command");
         let result = match self {
             SerialCommand::Keyboard(input_command) => {
-                trace!("Keyboard Input Sent: {}", input_command);
+                trace!("Keyboard Input Sent: {input_command}");
                 nvim.input(&input_command)
                     .await
                     .map(|_| ())
@@ -111,7 +111,7 @@ impl SerialCommand {
         };
 
         if let Err(error) = result {
-            log::error!("{:?}", error);
+            log::error!("{error:?}");
         }
     }
 }
@@ -207,7 +207,7 @@ impl ParallelCommand {
                 .exec_lua(
                     &format!(
                         "neovide.private.dropfile([[{}]], {})",
-                        handle_wslpaths(vec![path], settings.get::<CmdLineSettings>().wsl, false)
+                        handle_wslpaths(vec![path], settings.get::<CmdLineSettings>().wsl)
                             .first()
                             .unwrap(),
                         settings.get::<CmdLineSettings>().tabs
@@ -237,7 +237,7 @@ impl ParallelCommand {
         };
 
         if let Err(error) = result {
-            log::error!("{:?}", error);
+            log::error!("{error:?}");
         }
     }
 }
