@@ -1,7 +1,7 @@
 use std::{
-    io::{stdout, IsTerminal},
+    io::{IsTerminal, stdout},
     process::ExitCode,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Error, Result};
@@ -14,9 +14,10 @@ use winit::event_loop::EventLoop;
 use crate::windows_attach_to_console;
 
 use crate::{
-    bridge::{send_ui, ParallelCommand},
+    bridge::{ParallelCommand, require_active_handler, send_ui},
+    clipboard::Clipboard,
     settings::Settings,
-    window::{show_error_window, UserEvent},
+    window::{EventPayload, show_error_window},
 };
 
 fn show_error(explanation: &str) -> ! {
@@ -25,9 +26,11 @@ fn show_error(explanation: &str) -> ! {
 }
 
 pub fn show_nvim_error(msg: &str) {
-    send_ui(ParallelCommand::ShowError {
-        lines: msg.split('\n').map(|s| s.to_string()).collect_vec(),
-    });
+    let handler = require_active_handler();
+    send_ui(
+        ParallelCommand::ShowError { lines: msg.split('\n').map(|s| s.to_string()).collect_vec() },
+        &handler,
+    );
 }
 
 /// Formats, logs and displays the given message.
@@ -68,8 +71,9 @@ This is the error that caused the crash. In case you don't know what to do with 
 
 pub fn handle_startup_errors(
     err: Error,
-    event_loop: EventLoop<UserEvent>,
+    event_loop: EventLoop<EventPayload>,
     settings: Arc<Settings>,
+    clipboard: Arc<Mutex<Clipboard>>,
 ) -> ExitCode {
     // Command line output is always printed to the stdout/stderr
     if let Some(clap_error) = err.downcast_ref::<ClapError>() {
@@ -82,7 +86,7 @@ pub fn handle_startup_errors(
         log::error!("{}", &format_and_log_error_message(err));
         ExitCode::from(1)
     } else {
-        show_error_window(&format_and_log_error_message(err), event_loop, settings);
+        show_error_window(&format_and_log_error_message(err), event_loop, settings, clipboard);
         ExitCode::from(1)
     }
 }

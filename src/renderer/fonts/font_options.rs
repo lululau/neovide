@@ -2,15 +2,16 @@ use std::{collections::HashMap, fmt, iter, num::ParseFloatError, sync::Arc};
 
 use itertools::Itertools;
 use log::warn;
+use rmpv::Value;
 use serde::Deserialize;
 use skia_safe::{
-    font_style::{Slant, Weight, Width},
     FontStyle,
+    font_style::{Slant, Weight, Width},
 };
 
-use crate::{editor, error_msg};
+use crate::{editor, error_msg, settings::ParseFromValue};
 
-const DEFAULT_FONT_SIZE: f32 = 14.0;
+pub const DEFAULT_FONT_SIZE: f32 = 14.0;
 const FONT_OPTS_SEPARATOR: char = ':';
 const FONT_LIST_SEPARATOR: char = ',';
 const FONT_HINTING_PREFIX: &str = "#h-";
@@ -64,10 +65,7 @@ impl CoarseStyle {
     pub fn permutations() -> impl Iterator<Item = CoarseStyle> {
         iter::repeat_n([true, false], 2)
             .multi_cartesian_product()
-            .map(|values| CoarseStyle {
-                bold: values[0],
-                italic: values[1],
-            })
+            .map(|values| CoarseStyle { bold: values[0], italic: values[1] })
     }
 }
 
@@ -84,10 +82,7 @@ impl From<CoarseStyle> for FontStyle {
 
 impl From<&editor::Style> for CoarseStyle {
     fn from(fine_style: &editor::Style) -> Self {
-        Self {
-            bold: fine_style.bold,
-            italic: fine_style.italic,
-        }
+        Self { bold: fine_style.bold, italic: fine_style.italic }
     }
 }
 
@@ -109,6 +104,7 @@ pub struct FontOptions {
     pub width: f32,
     pub hinting: FontHinting,
     pub edging: FontEdging,
+    pub underline_offset: Option<f32>,
 }
 
 impl FontFeature {
@@ -136,13 +132,12 @@ impl FontOptions {
     pub fn parse(guifont_setting: &str) -> Result<FontOptions, &str> {
         let mut font_options = FontOptions::default();
 
-        let mut parts = guifont_setting
-            .split(FONT_OPTS_SEPARATOR)
-            .filter(|part| !part.is_empty());
+        let mut parts = guifont_setting.split(FONT_OPTS_SEPARATOR).filter(|part| !part.is_empty());
 
         if let Some(parts) = parts.next() {
             let parsed_font_list = parts
                 .split(FONT_LIST_SEPARATOR)
+                .map(str::trim_ascii)
                 .filter(|fallback| !fallback.is_empty())
                 .map(parse_font_name)
                 .collect_vec();
@@ -150,10 +145,7 @@ impl FontOptions {
             if !parsed_font_list.is_empty() {
                 font_options.normal = parsed_font_list
                     .into_iter()
-                    .map(|family| FontDescription {
-                        family,
-                        style: None,
-                    })
+                    .map(|family| FontDescription { family, style: None })
                     .collect();
             }
         }
@@ -260,6 +252,7 @@ impl Default for FontOptions {
             width: 0.0,
             hinting: FontHinting::default(),
             edging: FontEdging::default(),
+            underline_offset: None,
         }
     }
 }
@@ -336,6 +329,58 @@ impl FontHinting {
             "slight" => Ok(Self::Slight),
             "none" => Ok(Self::None),
             _ => Err(Self::INVALID_ERR),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Default)]
+#[allow(clippy::upper_case_acronyms)]
+pub enum PixelGeometry {
+    #[default]
+    Unknown,
+    RGBH,
+    BGRH,
+    RGBV,
+    BGRV,
+}
+
+impl ParseFromValue for PixelGeometry {
+    fn parse_from_value(&mut self, value: Value) {
+        match value.as_str() {
+            Some("Unknown") => *self = Self::Unknown,
+            Some("RGBH") => *self = Self::RGBH,
+            Some("BGRH") => *self = Self::BGRH,
+            Some("RGBV") => *self = Self::RGBV,
+            Some("BGRV") => *self = Self::BGRV,
+            _ => {
+                error_msg!(
+                    "Setting expected \"RGBH\", \"BGRH\", \"RGBV\", \"BGRV\", or \"Unknown\", but received {value:?}"
+                );
+            }
+        }
+    }
+}
+
+impl std::convert::From<PixelGeometry> for Value {
+    fn from(value: PixelGeometry) -> Self {
+        Value::from(match value {
+            PixelGeometry::Unknown => "Unknown",
+            PixelGeometry::RGBH => "RGBH",
+            PixelGeometry::BGRH => "BGRH",
+            PixelGeometry::RGBV => "RGBV",
+            PixelGeometry::BGRV => "BGRV",
+        })
+    }
+}
+
+impl From<PixelGeometry> for skia_safe::PixelGeometry {
+    fn from(value: PixelGeometry) -> Self {
+        match value {
+            PixelGeometry::Unknown => Self::Unknown,
+            PixelGeometry::RGBH => Self::RGBH,
+            PixelGeometry::BGRH => Self::BGRH,
+            PixelGeometry::RGBV => Self::RGBV,
+            PixelGeometry::BGRV => Self::BGRV,
         }
     }
 }
@@ -520,10 +565,7 @@ mod tests {
         let guifont_setting = "Fira Code Mono:h15.a";
         let err = FontOptions::parse(guifont_setting).unwrap_err();
 
-        assert_eq!(
-            err, INVALID_SIZE_ERR,
-            "parse err should equal {INVALID_SIZE_ERR}, but {err}",
-        );
+        assert_eq!(err, INVALID_SIZE_ERR, "parse err should equal {INVALID_SIZE_ERR}, but {err}",);
     }
 
     #[test]
@@ -531,10 +573,7 @@ mod tests {
         let guifont_setting = "Fira Code Mono:w1.b";
         let err = FontOptions::parse(guifont_setting).unwrap_err();
 
-        assert_eq!(
-            err, INVALID_WIDTH_ERR,
-            "parse err should equal {INVALID_WIDTH_ERR}, but {err}",
-        );
+        assert_eq!(err, INVALID_WIDTH_ERR, "parse err should equal {INVALID_WIDTH_ERR}, but {err}",);
     }
 
     #[test]

@@ -10,20 +10,17 @@ this behavior by adding keybindings in neovim.
 
 ```lua
 if vim.g.neovide then
-  vim.keymap.set('n', '<D-s>', ':w<CR>') -- Save
-  vim.keymap.set('v', '<D-c>', '"+y') -- Copy
-  vim.keymap.set('n', '<D-v>', '"+P') -- Paste normal mode
-  vim.keymap.set('v', '<D-v>', '"+P') -- Paste visual mode
-  vim.keymap.set('c', '<D-v>', '<C-R>+') -- Paste command mode
-  vim.keymap.set('i', '<D-v>', '<ESC>l"+Pli') -- Paste insert mode
-end
+  local function save() vim.cmd.write() end
+  local function copy() vim.cmd([[normal! "+y]]) end
+  local function paste() vim.api.nvim_paste(vim.fn.getreg("+"), true, -1) end
 
--- Allow clipboard copy paste in neovim
-vim.api.nvim_set_keymap('', '<D-v>', '+p<CR>', { noremap = true, silent = true})
-vim.api.nvim_set_keymap('!', '<D-v>', '<C-R>+', { noremap = true, silent = true})
-vim.api.nvim_set_keymap('t', '<D-v>', '<C-R>+', { noremap = true, silent = true})
-vim.api.nvim_set_keymap('v', '<D-v>', '<C-R>+', { noremap = true, silent = true})
+  vim.keymap.set({ "n", "i", "v" }, "<D-s>", save, { desc = "Save" })
+  vim.keymap.set("v", "<D-c>", copy, { silent = true, desc = "Copy" })
+  vim.keymap.set({ "n", "i", "v", "c", "t" }, "<D-v>", paste, { silent = true, desc = "Paste" })
+end
 ```
+
+On Windows/Linux, replace `<D-*>` with `<C-*>` (or `<S-C-*>` in terminals that capture Ctrl).
 
 ## How To Enable Floating And Popupmenu Transparency?
 
@@ -72,46 +69,100 @@ Credits to [BHatGuy here](https://github.com/neovide/neovide/pull/1589).
 
 ## How can I Dynamically Change The Transparency At Runtime? (macOS)
 
+from Nightly release `g:neovide_background_color` has been removed. To adjust the window
+transparency at runtime on macOS you only need to update `g:neovide_opacity` (and optionally
+`g:neovide_normal_opacity` for the editor background). Here is a simple example that binds the
+Command-`]`/Command-`[` keys to tweak the opacity:
+
 VimScript:
 
 ```vim
-" Set transparency and background color (title bar color)
-let g:neovide_opacity=0.0
-let g:neovide_opacity_point=0.8
-let g:neovide_background_color = '#0f1117'.printf('%x', float2nr(255 * g:neovide_opacity_point))
+let g:neovide_opacity = 0.8
 
-" Add keybinds to change transparency
 function! ChangeTransparency(delta)
-  let g:neovide_opacity_point = g:neovide_opacity_point + a:delta
-  let g:neovide_background_color = '#0f1117'.printf('%x', float2nr(255 * g:neovide_opacity_point))
+  let g:neovide_opacity = g:neovide_opacity + a:delta
+  if g:neovide_opacity > 1
+    let g:neovide_opacity = 1
+  elseif g:neovide_opacity < 0
+    let g:neovide_opacity = 0
+  endif
 endfunction
-noremap <expr><D-]> ChangeTransparency(0.01)
-noremap <expr><D-[> ChangeTransparency(-0.01)
+
+nnoremap <silent> <D-]> :call ChangeTransparency(0.01)<CR>
+nnoremap <silent> <D-[> :call ChangeTransparency(-0.01)<CR>
 ```
 
 Lua:
 
 ```lua
--- Helper function for transparency formatting
-local alpha = function()
-  return string.format("%x", math.floor(255 * vim.g.neovide_opacity_point or 0.8))
-end
--- Set transparency and background color (title bar color)
-vim.g.neovide_opacity = 0.0
-vim.g.neovide_opacity_point = 0.8
-vim.g.neovide_background_color = "#0f1117" .. alpha()
--- Add keybinds to change transparency
+vim.g.neovide_opacity = 0.8
+
 local change_transparency = function(delta)
-  vim.g.neovide_opacity_point = vim.g.neovide_opacity_point + delta
-  vim.g.neovide_background_color = "#0f1117" .. alpha()
+  local next_value = (vim.g.neovide_opacity or 1) + delta
+  vim.g.neovide_opacity = math.min(1, math.max(0, next_value))
 end
+
 vim.keymap.set({ "n", "v", "o" }, "<D-]>", function()
   change_transparency(0.01)
-end)
+end, { desc = "Increase Neovide opacity" })
 vim.keymap.set({ "n", "v", "o" }, "<D-[>", function()
   change_transparency(-0.01)
-end)
+end, { desc = "Decrease Neovide opacity" })
 ```
+
+## How To Enable Preedit Support Of IME?
+
+By default, the IME preedit event—that is, the preview of the text being composed—is not
+implemented. You can implement this preview yourself by using preedit_handler().
+
+Example:
+
+```lua
+local ime_context = {
+  base_col = 0,
+  base_row = 0,
+  preedit_col = 0,
+  preedit_row = 0,
+}
+
+---@param preedit_raw_text string
+---@param cursor_offset [integer, integer]: [start_col, end_col]
+preedit_handler = function(preedit_raw_text, cursor_offset)
+    vim.api.nvim_buf_set_text(
+      0,
+      ime_context.base_row - 1,
+      ime_context.base_col,
+      ime_context.preedit_row - 1,
+      ime_context.preedit_col,
+      {}
+    )
+    ime_context.preedit_col = ime_context.base_col + string.len(preedit_raw_text)
+    vim.api.nvim_buf_set_text(
+      0,
+      ime_context.base_row - 1,
+      ime_context.base_col,
+      ime_context.base_row - 1,
+      ime_context.base_col,
+      { preedit_raw_text }
+    )
+    vim.api.nvim_win_set_cursor(0, { ime_context.preedit_row, ime_context.preedit_col })
+end
+```
+
+Neovide also exposes a Lua function called commit_handler() in addition to preedit_handler(). For
+details, see [IME handling on the API page](api.html#ime-handling).
+
+If you’d prefer not to set this up yourself, you can use
+[sevenc-nanashi/neov-ime.nvim](https://github.com/sevenc-nanashi/neov-ime.nvim). Please refer to that
+repository for more information. Example: Installation with Lazy.nvim
+
+```lua
+return {
+  "sevenc-nanashi/neov-ime.nvim",
+}
+```
+
+Related: [PR #3110](https://github.com/neovide/neovide/pull/3110), [PR #3221](https://github.com/neovide/neovide/pull/3221)
 
 ## Neovide Is Not Picking Up Some Shell-configured Information
 
@@ -153,6 +204,29 @@ Winit looks in multiple locations for the configured dpi.
 Make sure its set in at least one of them. More details
 here: [#2010](https://github.com/neovide/neovide/issues/2010#issuecomment-1704416685).
 
+## Neovide fails to start with OpenGL/GLX
+
+If Neovide panics on startup with errors like the one below, or X11 errors such
+as `GLXBadFBConfig` or `BadMatch`, your system is likely exposing an older
+OpenGL version. Neovide requires OpenGL 3.3 and many virtualized setups
+(UTM/QEMU/virgl) only expose OpenGL 2.1.
+
+```text
+Neovide panicked with the message 'Failed to create OpenGL context'
+```
+
+A workaround for Mesa drivers exists:
+
+```bash
+MESA_GL_VERSION_OVERRIDE=3.3 MESA_GLSL_VERSION_OVERRIDE=330 neovide
+```
+
+If that does not work, your graphics stack may not support OpenGL 3.3
+
+See [#2068](https://github.com/neovide/neovide/issues/2068) and
+[#2008](https://github.com/neovide/neovide/issues/2008) for discussion
+about improving detection and/or lowering the requirement.
+
 ## How to turn off all animations?
 
 Animations can be turned off by setting the following global
@@ -167,6 +241,13 @@ vim.g.neovide_cursor_animate_command_line = false
 vim.g.neovide_scroll_animation_far_lines = 0
 vim.g.neovide_scroll_animation_length = 0.00
 ```
+
+## The default Neovim background is dark on a light Gnome theme
+
+Gnome does not support a genuine light theme. See [this Gnome
+issue](https://gitlab.gnome.org/GNOME/gnome-control-center/-/issues/1948). You can work around it by
+setting it manually with `gsettings set org.gnome.desktop.interface color-scheme prefer-light`.
+But do note that it resets when you change the Gnome theme.
 
 ## macOS Login Shells
 

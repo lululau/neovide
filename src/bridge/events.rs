@@ -9,7 +9,11 @@ use rmpv::Value;
 use skia_safe::Color4f;
 use strum::AsRefStr;
 
-use crate::editor::{Colors, CursorMode, CursorShape, Style, UnderlineStyle};
+use super::RestartDetails;
+use crate::{
+    editor::{Colors, CursorMode, CursorShape, Style, UnderlineStyle},
+    window::UserEvent,
+};
 
 #[derive(Clone, Debug)]
 pub enum ParseError {
@@ -153,6 +157,10 @@ pub enum RedrawEvent {
     SetTitle {
         title: String,
     },
+    /// Request the UI to restart Neovim.
+    Restart {
+        details: RestartDetails,
+    },
     ModeInfoSet {
         cursor_modes: Vec<CursorMode>,
     },
@@ -221,6 +229,11 @@ pub enum RedrawEvent {
     HighlightAttributesDefine {
         id: u64,
         style: Style,
+        name: Option<String>,
+    },
+    HighlightGroupSet {
+        name: String,
+        id: u64,
     },
     /// Redraw a continuous part of a `row` on a `grid`.
     ///
@@ -233,6 +246,14 @@ pub enum RedrawEvent {
         /// The column to start redrawing at.
         column_start: u64,
         cells: Vec<GridLineCell>,
+    },
+    /// Highlight a range of cells without redrawing text.
+    GridHighlight {
+        grid: u64,
+        row: u64,
+        column_start: u64,
+        column_end: u64,
+        highlight_id: u64,
     },
     /// Clear a `grid`.
     Clear {
@@ -416,6 +437,7 @@ pub enum RedrawEvent {
     },
     Suspend,
     NeovideSetRedraw(bool),
+    NeovideIntroBannerAllowed(bool),
 }
 
 fn unpack_color(packed_color: u64) -> Color4f {
@@ -423,12 +445,7 @@ fn unpack_color(packed_color: u64) -> Color4f {
     let r = ((packed_color & 0x00ff_0000) >> 16) as f32;
     let g = ((packed_color & 0xff00) >> 8) as f32;
     let b = (packed_color & 0xff) as f32;
-    Color4f {
-        r: r / 255.0,
-        g: g / 255.0,
-        b: b / 255.0,
-        a: 1.0,
-    }
+    Color4f { r: r / 255.0, g: g / 255.0, b: b / 255.0, a: 1.0 }
 }
 
 fn extract_values<const REQ: usize>(values: Vec<Value>) -> Result<[Value; REQ]> {
@@ -464,10 +481,7 @@ fn extract_values_with_optional<const REQ: usize, const OPT: usize>(
             }
         }
 
-        Ok((
-            required_values.try_into().unwrap(),
-            optional_values.try_into().unwrap(),
-        ))
+        Ok((required_values.try_into().unwrap(), optional_values.try_into().unwrap()))
     }
 }
 
@@ -505,9 +519,14 @@ fn parse_bool(bool_value: Value) -> Result<bool> {
 fn parse_set_title(set_title_arguments: Vec<Value>) -> Result<RedrawEvent> {
     let [title] = extract_values(set_title_arguments)?;
 
-    Ok(RedrawEvent::SetTitle {
-        title: parse_string(title)?,
-    })
+    Ok(RedrawEvent::SetTitle { title: parse_string(title)? })
+}
+
+fn parse_restart(arguments: Vec<Value>) -> Result<RedrawEvent> {
+    RestartDetails::from_values(&arguments).map_or_else(
+        || Err(ParseError::Format(format!("invalid restart event: {arguments:?}"))),
+        |details| Ok(RedrawEvent::Restart { details }),
+    )
 }
 
 fn parse_mode_info_set(mode_info_set_arguments: Vec<Value>) -> Result<RedrawEvent> {
@@ -663,14 +682,55 @@ fn parse_style(style_map: Value, _info_array: Value) -> Result<Style> {
     Ok(style)
 }
 
+fn parse_hl_name(infos: Value) -> Option<String> {
+    fn take_names(values: Vec<(Value, Value)>, names: &mut Vec<String>) {
+        let possible_keys = ["hi_name", "ui_name", "name", "link"];
+        for (key, value) in values {
+            let Some(key) = key.as_str() else { continue };
+            if !possible_keys.contains(&key) {
+                continue;
+            }
+            if let Some(name) = value.as_str() {
+                names.push(name.to_string());
+            }
+        }
+    }
+
+    let mut names: Vec<String> = Vec::new();
+    match infos {
+        Value::Map(values) => take_names(values, &mut names),
+        Value::Array(values) => {
+            for value in values {
+                if let Value::Map(v) = value {
+                    take_names(v, &mut names);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    if let Some(name) = names.iter().find(|name| name.starts_with("MatchParen")) {
+        return Some(name.clone());
+    }
+
+    names.into_iter().next()
+}
+
 fn parse_hl_attr_define(hl_attr_define_arguments: Vec<Value>) -> Result<RedrawEvent> {
     let [id, attributes, _terminal_attributes, infos] = extract_values(hl_attr_define_arguments)?;
 
-    let style = parse_style(attributes, infos)?;
+    let style = parse_style(attributes, infos.clone())?;
     Ok(RedrawEvent::HighlightAttributesDefine {
         id: parse_u64(id)?,
         style,
+        name: parse_hl_name(infos),
     })
+}
+
+fn parse_hl_group_set(hl_group_set_arguments: Vec<Value>) -> Result<RedrawEvent> {
+    let [name, id] = extract_values(hl_group_set_arguments)?;
+
+    Ok(RedrawEvent::HighlightGroupSet { name: parse_string(name)?, id: parse_u64(id)? })
 }
 
 fn parse_grid_line_cell(grid_line_cell: Value) -> Result<GridLineCell> {
@@ -685,22 +745,10 @@ fn parse_grid_line_cell(grid_line_cell: Value) -> Result<GridLineCell> {
         .map(take_value)
         .ok_or_else(|| ParseError::Format(format!("{cell_contents:?}")))?;
 
-    let highlight_id = cell_contents
-        .get_mut(1)
-        .map(take_value)
-        .map(parse_u64)
-        .transpose()?;
-    let repeat = cell_contents
-        .get_mut(2)
-        .map(take_value)
-        .map(parse_u64)
-        .transpose()?;
+    let highlight_id = cell_contents.get_mut(1).map(take_value).map(parse_u64).transpose()?;
+    let repeat = cell_contents.get_mut(2).map(take_value).map(parse_u64).transpose()?;
 
-    Ok(GridLineCell {
-        text: parse_string(text_value)?,
-        highlight_id,
-        repeat,
-    })
+    Ok(GridLineCell { text: parse_string(text_value)?, highlight_id, repeat })
 }
 
 fn parse_grid_line(grid_line_arguments: Vec<Value>) -> Result<RedrawEvent> {
@@ -717,20 +765,37 @@ fn parse_grid_line(grid_line_arguments: Vec<Value>) -> Result<RedrawEvent> {
     })
 }
 
+fn parse_grid_highlight(grid_highlight_arguments: Vec<Value>) -> Result<RedrawEvent> {
+    let [grid_id, row, column_start, column_end, highlight_id] =
+        extract_values(grid_highlight_arguments)?;
+    let validate = |v, field| {
+        (if v < 0 {
+            warn!("Negative grid highlight {field} received from Neovim {v}");
+            0
+        } else {
+            v
+        }) as u64
+    };
+
+    let grid = parse_u64(grid_id)?;
+    let row = validate(parse_i64(row)?, "row");
+    let column_start = validate(parse_i64(column_start)?, "column_start");
+    let column_end = validate(parse_i64(column_end)?, "column_end");
+    let highlight_id = validate(parse_i64(highlight_id)?, "highlight_id");
+
+    Ok(RedrawEvent::GridHighlight { grid, row, column_start, column_end, highlight_id })
+}
+
 fn parse_grid_clear(grid_clear_arguments: Vec<Value>) -> Result<RedrawEvent> {
     let [grid_id] = extract_values(grid_clear_arguments)?;
 
-    Ok(RedrawEvent::Clear {
-        grid: parse_u64(grid_id)?,
-    })
+    Ok(RedrawEvent::Clear { grid: parse_u64(grid_id)? })
 }
 
 fn parse_grid_destroy(grid_destroy_arguments: Vec<Value>) -> Result<RedrawEvent> {
     let [grid_id] = extract_values(grid_destroy_arguments)?;
 
-    Ok(RedrawEvent::Destroy {
-        grid: parse_u64(grid_id)?,
-    })
+    Ok(RedrawEvent::Destroy { grid: parse_u64(grid_id)? })
 }
 
 fn parse_grid_cursor_goto(cursor_goto_arguments: Vec<Value>) -> Result<RedrawEvent> {
@@ -810,25 +875,19 @@ fn parse_win_float_pos(win_float_pos_arguments: Vec<Value>) -> Result<RedrawEven
 fn parse_win_external_pos(win_external_pos_arguments: Vec<Value>) -> Result<RedrawEvent> {
     let [grid, _window] = extract_values(win_external_pos_arguments)?;
 
-    Ok(RedrawEvent::WindowExternalPosition {
-        grid: parse_u64(grid)?,
-    })
+    Ok(RedrawEvent::WindowExternalPosition { grid: parse_u64(grid)? })
 }
 
 fn parse_win_hide(win_hide_arguments: Vec<Value>) -> Result<RedrawEvent> {
     let [grid] = extract_values(win_hide_arguments)?;
 
-    Ok(RedrawEvent::WindowHide {
-        grid: parse_u64(grid)?,
-    })
+    Ok(RedrawEvent::WindowHide { grid: parse_u64(grid)? })
 }
 
 fn parse_win_close(win_close_arguments: Vec<Value>) -> Result<RedrawEvent> {
     let [grid] = extract_values(win_close_arguments)?;
 
-    Ok(RedrawEvent::WindowClose {
-        grid: parse_u64(grid)?,
-    })
+    Ok(RedrawEvent::WindowClose { grid: parse_u64(grid)? })
 }
 
 fn parse_msg_set_pos(msg_set_pos_arguments: Vec<Value>) -> Result<RedrawEvent> {
@@ -922,19 +981,14 @@ fn parse_cmdline_block_show(cmdline_block_show_arguments: Vec<Value>) -> Result<
     let [lines] = extract_values(cmdline_block_show_arguments)?;
 
     Ok(RedrawEvent::CommandLineBlockShow {
-        lines: parse_array(lines)?
-            .into_iter()
-            .map(parse_styled_content)
-            .collect::<Result<_>>()?,
+        lines: parse_array(lines)?.into_iter().map(parse_styled_content).collect::<Result<_>>()?,
     })
 }
 
 fn parse_cmdline_block_append(cmdline_block_append_arguments: Vec<Value>) -> Result<RedrawEvent> {
     let [line] = extract_values(cmdline_block_append_arguments)?;
 
-    Ok(RedrawEvent::CommandLineBlockAppend {
-        line: parse_styled_content(line)?,
-    })
+    Ok(RedrawEvent::CommandLineBlockAppend { line: parse_styled_content(line)? })
 }
 
 fn parse_msg_show(msg_show_arguments: Vec<Value>) -> Result<RedrawEvent> {
@@ -950,34 +1004,25 @@ fn parse_msg_show(msg_show_arguments: Vec<Value>) -> Result<RedrawEvent> {
 fn parse_msg_showmode(msg_showmode_arguments: Vec<Value>) -> Result<RedrawEvent> {
     let [content] = extract_values(msg_showmode_arguments)?;
 
-    Ok(RedrawEvent::MessageShowMode {
-        content: parse_styled_content(content)?,
-    })
+    Ok(RedrawEvent::MessageShowMode { content: parse_styled_content(content)? })
 }
 
 fn parse_msg_showcmd(msg_showcmd_arguments: Vec<Value>) -> Result<RedrawEvent> {
     let [content] = extract_values(msg_showcmd_arguments)?;
 
-    Ok(RedrawEvent::MessageShowCommand {
-        content: parse_styled_content(content)?,
-    })
+    Ok(RedrawEvent::MessageShowCommand { content: parse_styled_content(content)? })
 }
 
 fn parse_msg_ruler(msg_ruler_arguments: Vec<Value>) -> Result<RedrawEvent> {
     let [content] = extract_values(msg_ruler_arguments)?;
 
-    Ok(RedrawEvent::MessageRuler {
-        content: parse_styled_content(content)?,
-    })
+    Ok(RedrawEvent::MessageRuler { content: parse_styled_content(content)? })
 }
 
 fn parse_msg_history_entry(entry: Value) -> Result<(MessageKind, StyledContent)> {
     let [kind, content] = extract_values(parse_array(entry)?)?;
 
-    Ok((
-        MessageKind::parse(&parse_string(kind)?),
-        parse_styled_content(content)?,
-    ))
+    Ok((MessageKind::parse(&parse_string(kind)?), parse_styled_content(content)?))
 }
 
 fn parse_msg_history_show(msg_history_show_arguments: Vec<Value>) -> Result<RedrawEvent> {
@@ -1006,6 +1051,7 @@ pub fn parse_redraw_event(event_value: Value) -> Result<Vec<RedrawEvent>> {
         let event_parameters_copy = event_parameters.clone();
         let possible_parsed_event = match event_name.as_str() {
             "set_title" => Some(parse_set_title(event_parameters)),
+            "restart" => Some(parse_restart(event_parameters)),
             "set_icon" => None, // Ignore set icon for now
             "mode_info_set" => Some(parse_mode_info_set(event_parameters)),
             "option_set" => Some(parse_option_set(event_parameters)),
@@ -1018,7 +1064,9 @@ pub fn parse_redraw_event(event_value: Value) -> Result<Vec<RedrawEvent>> {
             "grid_resize" => Some(parse_grid_resize(event_parameters)),
             "default_colors_set" => Some(parse_default_colors(event_parameters)),
             "hl_attr_define" => Some(parse_hl_attr_define(event_parameters)),
+            "hl_group_set" => Some(parse_hl_group_set(event_parameters)),
             "grid_line" => Some(parse_grid_line(event_parameters)),
+            "grid_highlight" => Some(parse_grid_highlight(event_parameters)),
             "grid_clear" => Some(parse_grid_clear(event_parameters)),
             "grid_destroy" => Some(parse_grid_destroy(event_parameters)),
             "grid_cursor_goto" => Some(parse_grid_cursor_goto(event_parameters)),
@@ -1062,4 +1110,15 @@ pub fn parse_redraw_event(event_value: Value) -> Result<Vec<RedrawEvent>> {
     }
 
     Ok(parsed_events)
+}
+
+pub fn parse_progress_bar_event(value: Option<&Value>) -> Option<UserEvent> {
+    let map = value.filter(|v| matches!(v, Value::Map(_)))?.as_map()?;
+    let percent = map
+        .iter()
+        .find(|(key, _)| key.as_str() == Some("percent"))
+        .and_then(|(_, value)| value.as_f64())
+        .unwrap_or(0.0) as f32;
+
+    Some(UserEvent::ShowProgressBar { percent })
 }

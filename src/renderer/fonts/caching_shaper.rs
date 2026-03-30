@@ -1,20 +1,23 @@
-use std::{num::NonZeroUsize, sync::Arc};
+use std::{num::NonZeroUsize, rc::Rc};
 
 use itertools::Itertools;
-use log::{debug, error, info, trace};
+use log::{debug, error, info, trace, warn};
 use lru::LruCache;
-use skia_safe::{graphics::set_font_cache_limit, TextBlob, TextBlobBuilder};
+use skia_safe::{
+    TextBlob, TextBlobBuilder,
+    graphics::{font_cache_limit, font_cache_used, set_font_cache_limit},
+};
 use swash::{
+    Metrics,
     shape::ShapeContext,
     text::{
-        cluster::{CharCluster, Parser, Status, Token},
         Script,
+        cluster::{CharCluster, Parser, Status, Token},
     },
-    Metrics,
 };
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
+    editor::Word,
     error_msg,
     profiling::tracy_zone,
     renderer::fonts::{font_loader::*, font_options::*},
@@ -56,7 +59,7 @@ impl CachingShaper {
         shaper
     }
 
-    fn current_font_pair(&mut self) -> Arc<FontPair> {
+    fn current_font_pair(&mut self) -> Rc<FontPair> {
         self.font_loader
             .get_or_load(&FontKey {
                 font_desc: self.options.primary_font(),
@@ -109,25 +112,33 @@ impl CachingShaper {
             .unique()
             .collect::<Vec<_>>();
 
-        let failed_fonts = keys
-            .iter()
-            .filter(|key| self.font_loader.get_or_load(key).is_none())
-            .collect_vec();
+        if keys.is_empty() {
+            return;
+        }
 
-        if !failed_fonts.is_empty() {
+        let failed_fonts =
+            keys.iter().filter(|key| self.font_loader.get_or_load(key).is_none()).collect_vec();
+
+        if failed_fonts.len() == keys.len() {
             error_msg!(
                 "Font can't be updated to: {:#?}\n\
-                Following fonts couldn't be loaded: {}",
+                No candidate fonts could be loaded: {}",
                 options,
                 failed_fonts.iter().join(",\n"),
             );
+            return;
         }
 
-        if failed_fonts.len() != keys.len() {
-            debug!("Font updated to: {options:?}");
-            self.options = options;
-            self.reset_font_loader();
+        if !failed_fonts.is_empty() {
+            warn!(
+                "Some configured fonts could not be loaded and will be skipped: {}",
+                failed_fonts.iter().join(", ")
+            );
         }
+
+        debug!("Font updated to: {options:?}");
+        self.options = options;
+        self.reset_font_loader();
     }
 
     pub fn update_linespace(&mut self, linespace: f32) {
@@ -173,19 +184,13 @@ impl CachingShaper {
 
         let font_pair = self.current_font_pair();
         let size = self.current_size();
-        let mut shaper = self
-            .shape_context
-            .builder(font_pair.swash_font.as_ref())
-            .size(size)
-            .build();
+        let mut shaper =
+            self.shape_context.builder(font_pair.swash_font.as_ref()).size(size).build();
         shaper.add_str("M");
         let metrics = shaper.metrics();
         let mut advance = metrics.average_width;
         shaper.shape_with(|cluster| {
-            advance = cluster
-                .glyphs
-                .first()
-                .map_or(metrics.average_width, |g| g.advance);
+            advance = cluster.glyphs.first().map_or(metrics.average_width, |g| g.advance);
         });
         self.font_info = Some((metrics, advance));
         (metrics, advance)
@@ -209,7 +214,9 @@ impl CachingShaper {
 
     pub fn underline_offset(&mut self) -> f32 {
         let metrics = self.metrics();
-        if metrics.underline_offset != 0. {
+        if let Some(underline_offset) = self.options.underline_offset {
+            -underline_offset
+        } else if metrics.underline_offset != 0. {
             metrics.underline_offset
         } else {
             // If a font does not have an underline_offset, use the stroke_size as offset
@@ -233,31 +240,24 @@ impl CachingShaper {
 
     fn build_clusters(
         &mut self,
-        text: &str,
+        word: Word<'_>,
         style: CoarseStyle,
-    ) -> Vec<(Vec<CharCluster>, Arc<FontPair>)> {
+    ) -> Vec<(Vec<CharCluster>, Rc<FontPair>)> {
         let mut cluster = CharCluster::new();
 
         // Enumerate the characters storing the glyph index in the user data so that we can position
         // glyphs according to Neovim's grid rules
-        let mut character_index = 0;
         let mut parser = Parser::new(
             Script::Latin,
-            text.graphemes(true)
-                .enumerate()
-                .flat_map(|(glyph_index, unicode_segment)| {
-                    unicode_segment.chars().map(move |character| {
-                        let token = Token {
-                            ch: character,
-                            offset: character_index as u32,
-                            len: character.len_utf8() as u8,
-                            info: character.into(),
-                            data: glyph_index as u32,
-                        };
-                        character_index += 1;
-                        token
-                    })
-                }),
+            word.grapheme_clusters().flat_map(|(cell_index, cluster)| {
+                cluster.char_indices().map(move |(offset, character)| Token {
+                    ch: character,
+                    offset: offset as u32,
+                    len: character.len_utf8() as u8,
+                    info: character.into(),
+                    data: cell_index as u32,
+                })
+            }),
         );
 
         let mut results = Vec::new();
@@ -322,9 +322,8 @@ impl CachingShaper {
                 results.push((cluster.to_owned(), best.clone()));
             } else {
                 let fallback_character = cluster.chars()[0].ch;
-                if let Some(fallback_font) = self
-                    .font_loader
-                    .load_font_for_character(style, fallback_character)
+                if let Some(fallback_font) =
+                    self.font_loader.load_font_for_character(style, fallback_character)
                 {
                     results.push((cluster.to_owned(), fallback_font));
                 } else {
@@ -365,27 +364,30 @@ impl CachingShaper {
     }
 
     pub fn cleanup_font_cache(&self) {
-        tracy_zone!("purge_font_cache");
-        set_font_cache_limit(FONT_CACHE_SIZE / 2);
-        set_font_cache_limit(FONT_CACHE_SIZE);
+        // Only purge if we are truly about to exhaust the cache.
+        // See: https://github.com/neovide/neovide/issues/3299
+        // On high-DPI displays the old unconditional purge invalidated
+        // glyphs every frame, which forced the GPU to keep
+        // re-uploading textures and tanked performance.
+        let limit = font_cache_limit();
+        let used = font_cache_used();
+
+        if used > limit * 9 / 10 {
+            tracy_zone!("purge_font_cache");
+            set_font_cache_limit(FONT_CACHE_SIZE / 2);
+            set_font_cache_limit(FONT_CACHE_SIZE);
+        }
     }
 
-    pub fn shape(&mut self, text: String, style: CoarseStyle) -> Vec<TextBlob> {
+    pub fn shape(&mut self, word: Word<'_>, style: CoarseStyle) -> Vec<TextBlob> {
         let current_size = self.current_size();
         let glyph_width = self.font_base_dimensions().width;
 
         let mut resulting_blobs = Vec::new();
 
-        trace!("Shaping text: {text:?}");
-
-        for (cluster_group, font_pair) in self.build_clusters(&text, style) {
+        for (cluster_group, font_pair) in self.build_clusters(word, style) {
             let features = self.get_font_features(
-                font_pair
-                    .as_ref()
-                    .key
-                    .font_desc
-                    .as_ref()
-                    .map(|desc| desc.family.as_str()),
+                font_pair.as_ref().key.font_desc.as_ref().map(|desc| desc.family.as_str()),
             );
 
             let mut shaper = self
@@ -433,12 +435,14 @@ impl CachingShaper {
         resulting_blobs
     }
 
-    pub fn shape_cached(&mut self, text: String, style: CoarseStyle) -> &Vec<TextBlob> {
+    pub fn shape_cached(&mut self, word: Word<'_>, style: CoarseStyle) -> &Vec<TextBlob> {
         tracy_zone!("shape_cached");
-        let key = ShapeKey::new(text.clone(), style);
+        let text = word.text;
+        let key = ShapeKey::new(text.to_string(), style);
 
         if !self.blob_cache.contains(&key) {
-            let blobs = self.shape(text, style);
+            trace!("Shaping text: {text:?}");
+            let blobs = self.shape(word, style);
             self.blob_cache.put(key.clone(), blobs);
         }
 

@@ -167,6 +167,33 @@ a gamma of 0.8 and a contrast of 0.1.
 Note a gamma of 0.0, means standard sRGB gamma or 2.2. Also note that these settings don't
 necessarily apply immediately due to caching of the fonts.
 
+#### Pixel geometry
+
+VimScript:
+
+```vim
+let g:neovide_pixel_geometry = "RGBH"
+let g:neovide_pixel_geometry = "RGBH"
+```
+
+Lua:
+
+```lua
+vim.g.neovide_pixel_geometry = "RGBH"
+vim.g.neovide_pixel_geometry = "RGBH"
+```
+
+**Nightly.**
+
+Required for the guifont option `#e-subpixelantialias` to work. Defaults to "Unknown".
+
+Represents the physical location of the red, green, and blue light-emitting elements of your
+monitor. Possible options are "RGBH" (red on the left, green in the middle, and blue on the right,
+layed out horizontally), "BGRH" (horizontal, but flipped), "RGBV" (red on top, blue on bottom),
+"BGRV" (blue on top, red on bottom), and "Unknown" (effectively disables subpixel antialiasing).
+
+Most monitors are RGBH. If your monitor is rotated, it's probably something else.
+
 #### Padding
 
 VimScript:
@@ -192,46 +219,14 @@ vim.g.neovide_padding_left = 0
 Controls the space between the window border and the actual Neovim, which is filled with the
 background color instead.
 
-#### Background Color (**Deprecated**, Currently macOS only)
+#### Background Color (Removed at Nightly, Previously macOS only)
 
-This configuration is deprecated now and might be removed in the future. In
-[#2168](https://github.com/neovide/neovide/issues/2168), we have made Neovide control the title bar
-color itself. The color of title bar now honors [`neovide_opacity`](#transparency). If you want
-a transparent title bar, setting `neovide_opacity` is sufficient.
+This legacy configuration has now been fully removed. Neovide controls the title bar color
+automatically, and setting `g:neovide_background_color` no longer has any effect.
 
-VimScript:
-
-```vim
-" g:neovide_opacity should be 0 if you want to unify transparency of content and title bar.
-let g:neovide_opacity = 0.0
-let g:transparency = 0.8
-let g:neovide_background_color = '#0f1117'.printf('%x', float2nr(255 * g:transparency))
-```
-
-Lua:
-
-```lua
--- Helper function for transparency formatting
-local alpha = function()
-  return string.format("%x", math.floor(255 * vim.g.transparency or 0.8))
-end
--- g:neovide_opacity should be 0 if you want to unify transparency of content and title bar.
-vim.g.neovide_opacity = 0.0
-vim.g.transparency = 0.8
-vim.g.neovide_background_color = "#0f1117" .. alpha()
-```
-
-**Available since 0.10.**
-**Deprecated in 0.12.2.**
-
-![BackgroundColor](assets/BackgroundColor.png)
-
-Setting `g:neovide_background_color` to a value that can be parsed by
-[csscolorparser-rs](https://github.com/mazznoer/csscolorparser-rs) will set the color of the whole
-window to that value.
-
-Note that `g:neovide_opacity` should be 0 if you want to unify transparency of content and
-title bar.
+If you want a transparent title bar, simply configure [`g:neovide_opacity`](#transparency)
+(or its alias `g:neovide_transparency`) and, if needed, `g:neovide_normal_opacity` to tune how
+opaque the buffer content should remain.
 
 #### Title Bar Color (Currently Windows only)
 
@@ -260,6 +255,32 @@ vim.g.neovide_title_background_color = string.format(
 
 vim.g.neovide_title_text_color = "pink"
 ```
+
+#### Corner Preference (Currently Windows only)
+
+**Nightly.**
+
+VimScript:
+
+```vim
+let g:neovide_corner_preference = "round"
+```
+
+Lua:
+
+```lua
+vim.g.neovide_corner_preference = "round"
+```
+
+Setting `g:neovide_corner_preference` controls the preferred window corner style when supported by
+Windows.
+
+Accepted values:
+
+- `default`
+- `round`
+- `round_small`
+- `do_not_round`
 
 #### Window Blur (Currently macOS only)
 
@@ -390,7 +411,7 @@ vim.g.neovide_show_border = true
 
 Draw a grey border around opaque windows only.
 
-Default: `false`
+Default: `true`
 
 #### Position Animation Length
 
@@ -447,6 +468,34 @@ When scrolling more than one screen at a time, only this many lines at the end o
 will be animated. Set it to 0 to snap to the final position without any animation, or to something
 big like 9999 to always scroll the whole screen, much like Neovide <= 0.10.4 did.
 
+#### Progress Bar
+
+VimScript:
+
+```vim
+let g:neovide_progress_bar_enabled = v:true
+let g:neovide_progress_bar_height = 5.0
+let g:neovide_progress_bar_animation_speed = 200.0
+let g:neovide_progress_bar_hide_delay = 0.2
+```
+
+Lua:
+
+```lua
+vim.g.neovide_progress_bar_enabled = true
+vim.g.neovide_progress_bar_height = 5.0
+vim.g.neovide_progress_bar_animation_speed = 200.0
+vim.g.neovide_progress_bar_hide_delay = 0.2
+```
+
+**Nightly.**
+
+- `g:neovide_progress_bar_enabled` sets whether the progress bar is enabled.
+- `g:neovide_progress_bar_height` sets the height of the progress bar in pixels.
+- `g:neovide_progress_bar_animation_speed` sets the speed of the progress bar animation.
+- `g:neovide_progress_bar_hide_delay` sets the delay in seconds before the progress bar is
+  hidden after reaching 100%.
+
 #### Hiding the mouse when typing
 
 VimScript:
@@ -464,6 +513,25 @@ vim.g.neovide_hide_mouse_when_typing = false
 By setting this to `v:true`, the mouse will be hidden as soon as you start typing. This setting
 only affects the mouse if it is currently within the bounds of the neovide window. Moving the
 mouse makes it visible again.
+
+#### Mouse drag selection in message area
+
+VimScript:
+
+```vim
+let g:neovide_message_area_drag_selection = v:false
+```
+
+Lua:
+
+```lua
+vim.g.neovide_message_area_drag_selection = false
+```
+
+**Nightly.**
+
+Set this to `v:false` to disable drag selection in Neovide message windows, for example
+`:messages` or shell command output. This is enabled by default.
 
 #### Underline automatic scaling
 
@@ -507,6 +575,32 @@ vim.g.neovide_theme = 'auto'
 Set the [`background`](https://neovim.io/doc/user/options.html#'background') option when Neovide
 starts. Possible values: _light_, _dark_, _auto_. On systems that support it, _auto_ will mirror the
 system theme, and will update `background` when the system theme changes.
+
+**Nightly.**
+
+**NOTE:** The meaning of the setting has changed in 0.16.0. The default value of the Neovim
+[`background`](https://neovim.io/doc/user/options.html#'background') option is now always
+automatically set, and updates according to the system theme, as long as the user has not set it to
+something else.
+
+Sets the theme of the Neovide window on systems that supports it.
+
+- `auto` - Use the system theme
+- `light` - Set the window theme to light
+- `dark` - Set the window theme to dark
+- `bg_color` - Determine window theme from the Neovide normal/background color
+
+`bg`, which would mirror the Neovim background option is not supported yet, due to technical
+challenges. If you need that now it's best to set both `neovide_theme` and `background` to the same.
+
+The default is `auto`, except when using `--frame transparent` on macOS to preserve the old visual
+look with that configuration.
+
+Supported platforms:
+
+- Windows
+- MacOS
+- Linux Wayland with client-side decorations (Most notably Gnome)
 
 #### Layer grouping
 
@@ -718,6 +812,25 @@ some cases the hack itself is buggy and prevents the cursor from moving to the c
 should. In that case you can try to disable it, especially if you are not using cursor animations
 and the flickering does not bother as much.
 
+#### Highlight Matching Pair (macOS only)
+
+VimScript:
+
+```vim
+let g:neovide_highlight_matching_pair = v:true
+```
+
+Lua:
+
+```lua
+vim.g.neovide_highlight_matching_pair = true
+```
+
+**Nightly.**
+
+When enabled, Neovide highlights the matching pair using the system find indicator. The
+default is `false`.
+
 ### Input Settings
 
 #### macOS Option Key is Meta
@@ -794,6 +907,71 @@ vim.api.nvim_create_autocmd({ "CmdlineEnter", "CmdlineLeave" }, {
     callback = set_ime
 })
 ```
+
+#### macOS Multi-window (Editors)
+
+**Available on Nightly.**
+
+Neovide can show multiple windows on macOS either as separate OS windows or as native tabs inside a
+single host window.
+
+Set `system-native-tabs = true` to merge windows into a tab group. The native tab bar stays hidden
+until more than one tab exists to keep a clean single-window look.
+
+Use Window > New Window (cmd+n) or the Dock menu to open another Neovide window. If native tabs
+are enabled, new windows become tabs in the host window.
+
+If you have native tabs enabled, the Window menu shows an Editors entry and the Editors hotkey
+becomes available. You can also remap the in-app tab cycling shortcuts.
+
+#### macOS Global Activation Shortcuts
+
+Neovide registers system-wide shortcuts on macOS:
+
+- **Pinned** <kbd>⌘</kbd> + <kbd>⌃</kbd> + <kbd>Z</kbd> toggles the most recently used Neovide
+  window. If that window is already active, the shortcut hides it; otherwise it brings the window
+  to the front.
+- **Editors** <kbd>⌘</kbd> + <kbd>⌃</kbd> + <kbd>N</kbd> opens the Editors (tab overview) view so
+  you can pick another Neovide window. This shortcut is only available when
+  `system-native-tabs = true` and if only one window exists, it behaves the same as the pinned
+  shortcut.
+
+Customize them by setting the environment variables:
+
+```bash
+launchctl setenv NEOVIDE_SYSTEM_PINNED_HOTKEY "ctrl+shift+z"
+launchctl setenv NEOVIDE_SYSTEM_SWITCHER_HOTKEY "ctrl+shift+n"
+```
+
+Use `cmd`, `ctrl`, `alt`, and `shift` for modifiers and a single character for the key.
+
+To disable a shortcut entirely, set the corresponding variable to `false` or leave it empty.
+
+If a shortcut does not work, it may conflict with another global shortcut or be rejected by the
+system. Check the Neovide log for warnings.
+
+You can also configure them inside `config.toml`:
+
+```toml
+system-pinned-hotkey = "ctrl+shift+z"
+system-switcher-hotkey = "ctrl+shift+n"
+```
+
+When `system-native-tabs` is enabled, you can also customize the in-app tab navigation shortcuts:
+
+```toml
+system-tab-prev-hotkey = "cmd+shift+["
+system-tab-next-hotkey = "cmd+shift+]"
+```
+
+These work only while Neovide is focused so the keypress never reaches Neovim, mirroring the native
+macOS tab cycling workflow.
+
+Set either value to `false` (or an empty value) to disable that shortcut and pass the keypress
+through to Neovim.
+
+macOS may prompt you to grant Neovide Accessibility/Input Monitoring permissions the first time you
+use this feature so the shortcut can be detected outside the app.
 
 #### Touch Deadzone
 
@@ -994,6 +1172,25 @@ vim.g.neovide_cursor_smooth_blink = false
 If enabled, the cursor will smoothly animate the transition between the cursor's on and off state.
 The built in `guicursor` neovim option needs to be configured to enable blinking by having a value
 set for both `blinkoff`, `blinkon` and `blinkwait` for this setting to apply.
+
+#### Use covered cell colors for cursor fallback
+
+VimScript:
+
+```vim
+let g:neovide_cursor_cell_color_fallback = v:false
+```
+
+Lua:
+
+```lua
+vim.g.neovide_cursor_cell_color_fallback = false
+```
+
+If enabled, Neovide will use the resolved colors of the grid cell under the cursor when the
+`guicursor` highlight does not explicitly define cursor foreground or background colors. This makes
+the block cursor adapt to the text highlighting beneath it. Explicit cursor colors still take
+precedence.
 
 ### Cursor Particles
 
@@ -1235,6 +1432,29 @@ Only for the `railgun` vfx mode.
 Sets the velocity rotation speed of particles. The higher, the less particles actually move and look
 more "nervous", the lower, the more it looks like a collapsing sine wave.
 
-<!--
-  vim: textwidth=100
--->
+### Automatic settings, should be turned on/off for debug purposes only
+
+Note: These settings will be removed when the features are deemed stable. In most cases they are
+only here because the automatic detection of Neovim nightly versions does not always work.
+
+#### Autodetect mouse grid
+
+VimScript:
+
+```vim
+let g:neovide_has_mouse_grid_detection = v:true
+```
+
+Lua:
+
+```lua
+vim.g.neovide_has_mouse_grid_detection = true
+```
+
+**Nightly.**
+
+**Requires Neovim 0.12.0.**
+
+Neovim will detect the mouse grid for much better mouse compatibility when enabled. This is
+automaticaly enabled starting from Neovim Nightly September 20. 2025. You should not try to enable
+it manually for unsupported versions, since the behaviour is undefined.

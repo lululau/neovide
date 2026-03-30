@@ -14,12 +14,12 @@ use winit::{
 use glamour::{Contains, Point2};
 
 use crate::{
-    bridge::{send_ui, SerialCommand},
-    renderer::{Renderer, WindowDrawDetails},
+    bridge::{NeovimHandler, SerialCommand, send_ui},
+    editor::WindowType,
+    renderer::{MessageSelection, Renderer, WindowDrawDetails},
     settings::Settings,
-    units::{GridPos, GridScale, GridVec, PixelPos, PixelRect, PixelSize, PixelVec},
-    window::keyboard_manager::KeyboardManager,
-    window::WindowSettings,
+    units::{GridPos, GridScale, GridSize, GridVec, PixelPos, PixelRect, PixelSize, PixelVec},
+    window::{WindowSettings, keyboard_manager::KeyboardManager},
 };
 
 fn mouse_button_to_button_text(mouse_button: MouseButton) -> Option<String> {
@@ -38,11 +38,42 @@ struct DragDetails {
     button: MouseButton,
 }
 
-struct EditorState<'a> {
-    grid_scale: &'a GridScale,
-    window_regions: &'a Vec<WindowDrawDetails>,
-    window: &'a Window,
-    keyboard_manager: &'a KeyboardManager,
+#[derive(Clone, Debug)]
+struct MessageSelectionState {
+    draw_details: WindowDrawDetails,
+    start: GridPos<u32>,
+    end: GridPos<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub enum MessageSelectionEvent {
+    Outside,
+    Update(MessageSelection),
+    Finish(MessageSelection),
+    Clear,
+}
+
+#[derive(Clone, Debug, Default)]
+pub enum OverlayEvent {
+    #[default]
+    Unchanged,
+    MessageSelection(MessageSelectionEvent),
+}
+
+pub struct PointerTransitionResult {
+    pub overlay_event: OverlayEvent,
+}
+
+pub struct MouseEventResult {
+    pub overlay_event: OverlayEvent,
+}
+
+pub struct EditorState<'a> {
+    pub grid_scale: &'a GridScale,
+    pub window_regions: &'a Vec<WindowDrawDetails>,
+    pub full_region: WindowDrawDetails,
+    pub window: &'a Window,
+    pub keyboard_manager: &'a KeyboardManager,
 }
 
 #[derive(Debug)]
@@ -58,7 +89,7 @@ pub struct MouseManager {
     grid_position: GridPos<u32>,
 
     has_moved: bool,
-    window_position: PixelPos<f32>,
+    pub window_position: PixelPos<f32>,
 
     scroll_position: GridPos<f32>,
 
@@ -66,9 +97,15 @@ pub struct MouseManager {
     touch_position: HashMap<(DeviceId, u64), TouchTrace>,
 
     mouse_hidden: bool,
+    // tracks whether we need to force a cursor visibility resync once focus returns.
+    // on macos, alt-tabbing while hidden keeps appkit in a cursor hidden mode that ignores
+    // redundant show requests https://github.com/rust-windowing/winit/issues/1295 so we
+    // remember to toggle visibility once we regain focus.
+    cursor_resync_needed: bool,
     pub enabled: bool,
 
     settings: Arc<Settings>,
+    message_selection: Option<MessageSelectionState>,
 }
 
 impl MouseManager {
@@ -81,32 +118,89 @@ impl MouseManager {
             scroll_position: GridPos::default(),
             touch_position: HashMap::new(),
             mouse_hidden: false,
+            cursor_resync_needed: false,
             enabled: true,
             settings,
+            message_selection: None,
         }
     }
 
-    fn get_window_details_under_mouse<'b>(
+    fn request_cursor_visible(&mut self, window: &Window) {
+        window.set_cursor_visible(true);
+        self.mouse_hidden = false;
+        // remember to reapply on focus regain if we changed visibility while unfocused.
+        self.cursor_resync_needed = !window.has_focus();
+    }
+
+    fn force_cursor_visible(&mut self, window: &Window) {
+        #[cfg(target_os = "macos")]
+        {
+            // winit short-circuits duplicate visibility requests and AppKit won't repaint when the
+            // window is unfocused https://github.com/rust-windowing/winit/issues/1295 so flip to
+            // false first to ensure the following true call is seen.
+            // TODO: move this workaround into winit so visibility resyncs automatically.
+            window.set_cursor_visible(false);
+        }
+        window.set_cursor_visible(true);
+        self.mouse_hidden = false;
+        self.cursor_resync_needed = false;
+    }
+
+    fn hide_cursor(&mut self, window: &Window) {
+        window.set_cursor_visible(false);
+        self.mouse_hidden = true;
+        self.cursor_resync_needed = false;
+    }
+
+    fn handle_focus_gain(&mut self, window: &Window) {
+        if self.cursor_resync_needed {
+            self.force_cursor_visible(window);
+        }
+    }
+
+    fn handle_focus_loss(&mut self, window: &Window) {
+        if self.mouse_hidden {
+            self.request_cursor_visible(window);
+            self.cursor_resync_needed = true;
+        }
+    }
+
+    fn handle_focus_change(&mut self, window: &Window, focused: bool) {
+        if focused {
+            self.handle_focus_gain(window);
+        } else {
+            self.handle_focus_loss(window);
+        }
+    }
+
+    pub fn get_window_details_under_mouse<'b>(
         &self,
         editor_state: &'b EditorState<'b>,
     ) -> Option<&'b WindowDrawDetails> {
         let position = self.window_position;
-
-        // the rendered window regions are sorted by draw order, so the earlier windows in the
-        // list are drawn under the later ones
-        editor_state
-            .window_regions
-            .iter()
-            .filter(|details| details.region.contains(&position))
-            .next_back()
+        if self.settings.get::<WindowSettings>().has_mouse_grid_detection {
+            Some(&editor_state.full_region)
+        } else {
+            // the rendered window regions are sorted by draw order, so the earlier windows in the
+            // list are drawn under the later ones
+            editor_state.window_regions.iter().rfind(|details| details.region.contains(&position))
+        }
     }
 
-    fn get_relative_position(
+    fn get_window_details_under_mouse_raw<'b>(
         &self,
+        editor_state: &'b EditorState<'b>,
+    ) -> Option<&'b WindowDrawDetails> {
+        let position = self.window_position;
+        editor_state.window_regions.iter().rfind(|details| details.region.contains(&position))
+    }
+
+    fn get_relative_position_at(
+        window_position: PixelPos<f32>,
         window_details: &WindowDrawDetails,
         editor_state: &EditorState,
     ) -> GridPos<u32> {
-        let relative_position = (self.window_position - window_details.region.min).to_point();
+        let relative_position = (window_position - window_details.region.min).to_point();
         (relative_position / *editor_state.grid_scale)
             .floor()
             .max((0.0, 0.0).into())
@@ -118,23 +212,75 @@ impl MouseManager {
             ))
     }
 
-    fn handle_pointer_motion(&mut self, position: PixelPos<f32>, editor_state: &EditorState) {
+    pub fn get_relative_position(
+        &self,
+        window_details: &WindowDrawDetails,
+        editor_state: &EditorState,
+    ) -> GridPos<u32> {
+        Self::get_relative_position_at(self.window_position, window_details, editor_state)
+    }
+
+    pub fn clear_message_selection(&mut self) -> bool {
+        let had_selection = self.message_selection.take().is_some();
+        if had_selection {
+            self.drag_details = None;
+            self.has_moved = false;
+        }
+
+        had_selection
+    }
+
+    fn message_area_drag_selection_enabled(&self) -> bool {
+        self.settings.get::<WindowSettings>().message_area_drag_selection
+    }
+
+    fn handle_pointer_motion(
+        &mut self,
+        position: PixelPos<f32>,
+        editor_state: &EditorState,
+        neovim_handler: &NeovimHandler,
+    ) -> MessageSelectionEvent {
         let window_size = editor_state.window.inner_size();
         let window_size = PixelSize::new(window_size.width as f32, window_size.height as f32);
         let relative_window_rect = PixelRect::from_size(window_size);
 
         self.window_position = position;
 
+        let message_selection_enabled = self.message_area_drag_selection_enabled();
+        if !message_selection_enabled && self.clear_message_selection() {
+            return MessageSelectionEvent::Clear;
+        }
+
+        if let Some(selection) = &mut self.message_selection {
+            let window_position = self.window_position;
+            let end = Self::get_relative_position_at(
+                window_position,
+                &selection.draw_details,
+                editor_state,
+            );
+            selection.end = end;
+            self.grid_position = end;
+            return MessageSelectionEvent::Update(MessageSelection {
+                grid_id: selection.draw_details.id,
+                start: selection.start,
+                end,
+            });
+        }
+
         // If dragging, the relevant window (the one which we send all commands to) is the one
         // which the mouse drag started on. Otherwise its the top rendered window
         let window_details = if let Some(drag_details) = &self.drag_details {
-            editor_state
-                .window_regions
-                .iter()
-                .find(|details| details.id == drag_details.draw_details.id)
+            if self.settings.get::<WindowSettings>().has_mouse_grid_detection {
+                Some(&editor_state.full_region)
+            } else {
+                editor_state
+                    .window_regions
+                    .iter()
+                    .find(|details| details.id == drag_details.draw_details.id)
+            }
         } else {
             if !relative_window_rect.contains(&position) {
-                return;
+                return MessageSelectionEvent::Outside;
             }
 
             self.get_window_details_under_mouse(editor_state)
@@ -149,29 +295,149 @@ impl MouseManager {
 
             if has_moved {
                 if let Some(drag_details) = &self.drag_details {
-                    send_ui(SerialCommand::Drag {
-                        button: mouse_button_to_button_text(drag_details.button).unwrap(),
-                        grid_id: window_details.event_grid_id(&self.settings),
-                        position: self.grid_position.to_tuple(),
-                        modifier_string: editor_state
-                            .keyboard_manager
-                            .format_modifier_string("", true),
-                    });
+                    send_ui(
+                        SerialCommand::Drag {
+                            button: mouse_button_to_button_text(drag_details.button).unwrap(),
+                            grid_id: window_details.event_grid_id(&self.settings),
+                            position: self.grid_position.to_tuple(),
+                            modifier_string: editor_state
+                                .keyboard_manager
+                                .format_modifier_string("", true),
+                        },
+                        neovim_handler,
+                    );
                 } else if self.settings.get::<WindowSettings>().mouse_move_event {
                     // Send a mouse move command
-                    send_ui(SerialCommand::MouseButton {
-                        button: "move".into(),
-                        action: "".into(), // this is ignored by nvim
-                        grid_id: window_details.event_grid_id(&self.settings),
-                        position: relative_position.to_tuple(),
-                        modifier_string: editor_state
-                            .keyboard_manager
-                            .format_modifier_string("", true),
-                    })
+                    send_ui(
+                        SerialCommand::MouseButton {
+                            button: "move".into(),
+                            action: "".into(), // this is ignored by nvim
+                            grid_id: window_details.event_grid_id(&self.settings),
+                            position: relative_position.to_tuple(),
+                            modifier_string: editor_state
+                                .keyboard_manager
+                                .format_modifier_string("", true),
+                        },
+                        neovim_handler,
+                    );
                 }
             }
 
             self.has_moved = self.drag_details.is_some() && (self.has_moved || has_moved);
+        }
+
+        MessageSelectionEvent::Outside
+    }
+
+    fn update_message_selection_on_button(
+        &mut self,
+        mouse_button: MouseButton,
+        down: bool,
+        editor_state: &EditorState,
+    ) -> Option<MessageSelectionEvent> {
+        if !self.message_area_drag_selection_enabled() {
+            return self.clear_message_selection().then_some(MessageSelectionEvent::Clear);
+        }
+
+        // MouseInput only reports press/release. we start message selection on left press,
+        // this keeps the selection as a *client* overlay and avoids interfering with neovim
+        // mouse handling outside message windows.
+        if !down && mouse_button == MouseButton::Left {
+            if let Some(selection) = self.message_selection.take() {
+                let end = self.get_relative_position(&selection.draw_details, editor_state);
+                self.drag_details = None;
+                self.has_moved = false;
+                return Some(MessageSelectionEvent::Finish(MessageSelection {
+                    grid_id: selection.draw_details.id,
+                    start: selection.start,
+                    end,
+                }));
+            }
+        }
+
+        if down && mouse_button == MouseButton::Left {
+            let details = self.get_window_details_under_mouse_raw(editor_state);
+            let allow_selection = details
+                .map(|details| matches!(details.window_type, WindowType::Message { .. }))
+                .unwrap_or(false);
+
+            if !allow_selection && self.message_selection.is_some() {
+                self.message_selection = None;
+                return Some(MessageSelectionEvent::Clear);
+            }
+
+            if let Some(details) = details {
+                if allow_selection {
+                    let position = self.get_relative_position(details, editor_state);
+                    self.message_selection = Some(MessageSelectionState {
+                        draw_details: details.clone(),
+                        start: position,
+                        end: position,
+                    });
+                    self.drag_details = None;
+                    self.has_moved = false;
+                    return Some(MessageSelectionEvent::Update(MessageSelection {
+                        grid_id: details.id,
+                        start: position,
+                        end: position,
+                    }));
+                }
+            }
+        }
+
+        None
+    }
+
+    fn send_nvim_mouse_button(
+        &mut self,
+        mouse_button: MouseButton,
+        down: bool,
+        editor_state: &EditorState,
+        neovim_handler: &NeovimHandler,
+    ) {
+        // For some reason pointer down is handled differently from pointer up and drag.
+        // Floating windows: relative coordinates are great.
+        // Non floating windows: rather than global coordinates, relative are needed
+        if !self.enabled {
+            return;
+        }
+
+        if let Some(button_text) = mouse_button_to_button_text(mouse_button) {
+            if let &Some(details) = &self.get_window_details_under_mouse(editor_state) {
+                let action = if down { "press".to_owned() } else { "release".to_owned() };
+
+                let position = if !down && self.has_moved {
+                    self.grid_position
+                } else {
+                    self.get_relative_position(details, editor_state)
+                };
+
+                send_ui(
+                    SerialCommand::MouseButton {
+                        button: button_text.clone(),
+                        action,
+                        grid_id: details.event_grid_id(&self.settings),
+                        position: position.to_tuple(),
+                        modifier_string: editor_state
+                            .keyboard_manager
+                            .format_modifier_string("", true),
+                    },
+                    neovim_handler,
+                );
+
+                if down {
+                    self.drag_details =
+                        Some(DragDetails { button: mouse_button, draw_details: details.clone() });
+                } else {
+                    self.drag_details = None;
+                }
+            } else {
+                self.drag_details = None;
+            }
+
+            if self.drag_details.is_none() {
+                self.has_moved = false;
+            }
         }
     }
 
@@ -180,63 +446,39 @@ impl MouseManager {
         mouse_button: MouseButton,
         down: bool,
         editor_state: &EditorState,
-    ) {
-        // For some reason pointer down is handled differently from pointer up and drag.
-        // Floating windows: relative coordinates are great.
-        // Non floating windows: rather than global coordinates, relative are needed
-        if self.enabled {
-            if let Some(button_text) = mouse_button_to_button_text(mouse_button) {
-                if let &Some(details) = &self.get_window_details_under_mouse(editor_state) {
-                    let action = if down {
-                        "press".to_owned()
-                    } else {
-                        "release".to_owned()
-                    };
+        neovim_handler: &NeovimHandler,
+    ) -> PointerTransitionResult {
+        let message_selection_event =
+            self.update_message_selection_on_button(mouse_button, down, editor_state);
+        let consume_mouse_input = matches!(
+            message_selection_event.as_ref(),
+            Some(MessageSelectionEvent::Update(_) | MessageSelectionEvent::Finish(_))
+        );
 
-                    let position = if !down && self.has_moved {
-                        self.grid_position
-                    } else {
-                        self.get_relative_position(details, editor_state)
-                    };
+        if !consume_mouse_input {
+            self.send_nvim_mouse_button(mouse_button, down, editor_state, neovim_handler);
+        }
 
-                    send_ui(SerialCommand::MouseButton {
-                        button: button_text.clone(),
-                        action,
-                        grid_id: details.event_grid_id(&self.settings),
-                        position: position.to_tuple(),
-                        modifier_string: editor_state
-                            .keyboard_manager
-                            .format_modifier_string("", true),
-                    });
-
-                    if down {
-                        self.drag_details = Some(DragDetails {
-                            button: mouse_button,
-                            draw_details: details.clone(),
-                        });
-                    } else {
-                        self.drag_details = None;
-                    }
-                } else {
-                    self.drag_details = None;
-                }
-
-                if self.drag_details.is_none() {
-                    self.has_moved = false;
-                }
-            }
+        PointerTransitionResult {
+            overlay_event: message_selection_event
+                .map(OverlayEvent::MessageSelection)
+                .unwrap_or_default(),
         }
     }
 
-    fn handle_line_scroll(&mut self, amount: GridVec<f32>, editor_state: &EditorState) {
+    fn handle_line_scroll(
+        &mut self,
+        amount: GridVec<f32>,
+        editor_state: &EditorState,
+        neovim_handler: &NeovimHandler,
+    ) {
         if !self.enabled {
             return;
         }
 
         let draw_details = self.get_window_details_under_mouse(editor_state);
-        let grid_id = draw_details
-            .map(|details| details.event_grid_id(&self.settings))
-            .unwrap_or(0);
+        let grid_id =
+            draw_details.map(|details| details.event_grid_id(&self.settings)).unwrap_or(0);
 
         let previous: GridPos<i32> = self.scroll_position.floor().try_cast().unwrap();
         self.scroll_position += amount;
@@ -253,12 +495,10 @@ impl MouseManager {
                 direction: input_type.to_string(),
                 grid_id,
                 position: self.grid_position.to_tuple(),
-                modifier_string: editor_state
-                    .keyboard_manager
-                    .format_modifier_string("", true),
+                modifier_string: editor_state.keyboard_manager.format_modifier_string("", true),
             };
             for _ in 0..(new.y - previous.y).abs() {
-                send_ui(scroll_command.clone());
+                send_ui(scroll_command.clone(), neovim_handler);
             }
         }
 
@@ -273,19 +513,22 @@ impl MouseManager {
                 direction: input_type.to_string(),
                 grid_id,
                 position: self.grid_position.to_tuple(),
-                modifier_string: editor_state
-                    .keyboard_manager
-                    .format_modifier_string("", true),
+                modifier_string: editor_state.keyboard_manager.format_modifier_string("", true),
             };
             for _ in 0..(new.x - previous.x).abs() {
-                send_ui(scroll_command.clone());
+                send_ui(scroll_command.clone(), neovim_handler);
             }
         }
     }
 
-    fn handle_pixel_scroll(&mut self, amount: PixelVec<f32>, editor_state: &EditorState) {
+    fn handle_pixel_scroll(
+        &mut self,
+        amount: PixelVec<f32>,
+        editor_state: &EditorState,
+        neovim_handler: &NeovimHandler,
+    ) {
         let amount = amount / *editor_state.grid_scale;
-        self.handle_line_scroll(amount, editor_state);
+        self.handle_line_scroll(amount, editor_state, neovim_handler);
     }
 
     fn handle_touch(
@@ -294,6 +537,7 @@ impl MouseManager {
         location: PixelPos<f32>,
         phase: &TouchPhase,
         editor_state: &EditorState,
+        neovim_handler: &NeovimHandler,
     ) {
         match phase {
             TouchPhase::Started => {
@@ -335,7 +579,11 @@ impl MouseManager {
                     }
 
                     if self.drag_details.is_some() || dragging_just_now {
-                        self.handle_pointer_motion((location.x, location.y).into(), editor_state);
+                        self.handle_pointer_motion(
+                            (location.x, location.y).into(),
+                            editor_state,
+                            neovim_handler,
+                        );
                     }
                     // the double check might seem useless, but the if branch above might set
                     // trace.left_deadzone_once - which urges to check again
@@ -346,27 +594,52 @@ impl MouseManager {
                         // starting point
                         trace.last = location;
 
-                        self.handle_pixel_scroll(delta, editor_state);
+                        self.handle_pixel_scroll(delta, editor_state, neovim_handler);
                     }
                 }
 
                 if dragging_just_now {
-                    self.handle_pointer_motion((location.x, location.y).into(), editor_state);
-                    self.handle_pointer_transition(MouseButton::Left, true, editor_state);
+                    self.handle_pointer_motion(
+                        (location.x, location.y).into(),
+                        editor_state,
+                        neovim_handler,
+                    );
+                    self.handle_pointer_transition(
+                        MouseButton::Left,
+                        true,
+                        editor_state,
+                        neovim_handler,
+                    );
                 }
             }
             TouchPhase::Ended | TouchPhase::Cancelled => {
                 if let Some(trace) = self.touch_position.remove(&finger_id) {
                     if self.drag_details.is_some() {
-                        self.handle_pointer_transition(MouseButton::Left, false, editor_state);
+                        self.handle_pointer_transition(
+                            MouseButton::Left,
+                            false,
+                            editor_state,
+                            neovim_handler,
+                        );
                     }
                     if !trace.left_deadzone_once {
                         self.handle_pointer_motion(
                             (trace.start.x, trace.start.y).into(),
                             editor_state,
+                            neovim_handler,
                         );
-                        self.handle_pointer_transition(MouseButton::Left, true, editor_state);
-                        self.handle_pointer_transition(MouseButton::Left, false, editor_state);
+                        self.handle_pointer_transition(
+                            MouseButton::Left,
+                            true,
+                            editor_state,
+                            neovim_handler,
+                        );
+                        self.handle_pointer_transition(
+                            MouseButton::Left,
+                            false,
+                            editor_state,
+                            neovim_handler,
+                        );
                     }
                 }
             }
@@ -379,65 +652,88 @@ impl MouseManager {
         keyboard_manager: &KeyboardManager,
         renderer: &Renderer,
         window: &Window,
-    ) {
+        neovim_handler: &NeovimHandler,
+    ) -> MouseEventResult {
+        let full_region = WindowDrawDetails {
+            id: 0,
+            region: renderer.window_regions.first().map_or(PixelRect::ZERO, |v| v.region),
+            grid_size: renderer.window_regions.first().map_or(GridSize::ZERO, |v| v.grid_size),
+            window_type: crate::editor::WindowType::Editor,
+        };
         let editor_state = EditorState {
             grid_scale: &renderer.grid_renderer.grid_scale,
             window_regions: &renderer.window_regions,
+            full_region,
             window,
             keyboard_manager,
         };
+        let hide_mouse_when_typing = self.settings.get::<WindowSettings>().hide_mouse_when_typing;
+        let mut overlay_event = OverlayEvent::default();
         match event {
             WindowEvent::CursorMoved { position, .. } => {
-                self.handle_pointer_motion(
+                let message_selection_event = self.handle_pointer_motion(
                     (position.x as f32, position.y as f32).into(),
                     &editor_state,
+                    neovim_handler,
                 );
+                overlay_event = match message_selection_event {
+                    MessageSelectionEvent::Outside => OverlayEvent::default(),
+                    event => OverlayEvent::MessageSelection(event),
+                };
                 if self.mouse_hidden && window.has_focus() {
-                    window.set_cursor_visible(true);
-                    self.mouse_hidden = false;
+                    self.request_cursor_visible(window);
+                } else if self.cursor_resync_needed && window.has_focus() {
+                    self.force_cursor_visible(window);
                 }
             }
-            WindowEvent::MouseWheel {
-                delta: MouseScrollDelta::LineDelta(x, y),
-                ..
-            } => self.handle_line_scroll((*x, *y).into(), &editor_state),
-            WindowEvent::MouseWheel {
-                delta: MouseScrollDelta::PixelDelta(delta),
-                ..
-            } => self.handle_pixel_scroll((delta.x as f32, delta.y as f32).into(), &editor_state),
-            WindowEvent::Touch(Touch {
-                device_id,
-                id,
-                location,
-                phase,
-                ..
-            }) => self.handle_touch(
+            WindowEvent::CursorEntered { .. } => {
+                if self.mouse_hidden {
+                    self.request_cursor_visible(window);
+                } else if self.cursor_resync_needed && window.has_focus() {
+                    self.force_cursor_visible(window);
+                }
+            }
+            WindowEvent::MouseWheel { delta: MouseScrollDelta::LineDelta(x, y), .. } => {
+                self.handle_line_scroll((*x, *y).into(), &editor_state, neovim_handler)
+            }
+            WindowEvent::MouseWheel { delta: MouseScrollDelta::PixelDelta(delta), .. } => self
+                .handle_pixel_scroll(
+                    (delta.x as f32, delta.y as f32).into(),
+                    &editor_state,
+                    neovim_handler,
+                ),
+            WindowEvent::Touch(Touch { device_id, id, location, phase, .. }) => self.handle_touch(
                 (*device_id, *id),
                 PixelPos::new(location.x as f32, location.y as f32),
                 phase,
                 &editor_state,
+                neovim_handler,
             ),
-            WindowEvent::MouseInput { button, state, .. } => self.handle_pointer_transition(
-                *button,
-                state == &ElementState::Pressed,
-                &editor_state,
-            ),
+            WindowEvent::MouseInput { button, state, .. } => {
+                overlay_event = self
+                    .handle_pointer_transition(
+                        *button,
+                        state == &ElementState::Pressed,
+                        &editor_state,
+                        neovim_handler,
+                    )
+                    .overlay_event;
+            }
 
-            WindowEvent::KeyboardInput {
-                event: key_event, ..
-            } => {
-                if key_event.state == ElementState::Pressed {
-                    let window_settings = self.settings.get::<WindowSettings>();
-                    if window_settings.hide_mouse_when_typing
-                        && !self.mouse_hidden
-                        && window.has_focus()
-                    {
-                        window.set_cursor_visible(false);
-                        self.mouse_hidden = true;
-                    }
-                }
+            WindowEvent::KeyboardInput { event: key_event, .. }
+                if hide_mouse_when_typing
+                    && key_event.state == ElementState::Pressed
+                    && !self.mouse_hidden
+                    && window.has_focus() =>
+            {
+                self.hide_cursor(window);
+            }
+            WindowEvent::Focused(focused_event) if hide_mouse_when_typing => {
+                self.handle_focus_change(window, *focused_event);
             }
             _ => {}
         }
+
+        MouseEventResult { overlay_event }
     }
 }

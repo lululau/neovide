@@ -1,1 +1,2 @@
-# use defaults
+style_edition = "2024"
+use_small_heuristics = "Max"

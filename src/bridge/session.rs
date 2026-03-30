@@ -9,9 +9,9 @@ use std::{
 };
 
 use anyhow::Context;
-use nvim_rs::{error::LoopError, neovim::Neovim, Handler};
+use nvim_rs::{Handler, error::LoopError, neovim::Neovim};
 use tokio::{
-    io::{split, AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader, split},
     net::TcpStream,
     process::{Child, Command},
     spawn,
@@ -29,14 +29,14 @@ pub struct NeovimSession {
     pub io_handle: JoinHandle<std::result::Result<(), Box<LoopError>>>,
     pub neovim_process: Option<Child>,
     pub stderr_task: Option<JoinHandle<Vec<String>>>,
+    #[cfg(not(target_os = "windows"))]
+    pub stdin_fd: Option<rustix::fd::OwnedFd>,
 }
 
 #[cfg(debug_assertions)]
 impl fmt::Debug for NeovimSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("NeovimSession")
-            .field("io_handle", &self.io_handle)
-            .finish()
+        f.debug_struct("NeovimSession").field("io_handle", &self.io_handle).finish()
     }
 }
 
@@ -45,6 +45,10 @@ impl NeovimSession {
         instance: NeovimInstance,
         handler: impl Handler<Writer = NeovimWriter>,
     ) -> anyhow::Result<Self> {
+        // This needs to be done before the process is spawned, since the file descriptors are
+        // inherited on unix-like systems
+        #[cfg(not(target_os = "windows"))]
+        let stdin_fd = instance.forward_stdin();
         let (reader, writer, stderr_reader, neovim_process) = instance.connect().await?;
         // Spawn a background task to read from stderr
         let stderr_task = stderr_reader.map(|reader| {
@@ -84,6 +88,8 @@ impl NeovimSession {
                     io_handle,
                     neovim_process,
                     stderr_task,
+                    #[cfg(not(target_os = "windows"))]
+                    stdin_fd,
                 })
             }
         }
@@ -120,31 +126,14 @@ impl NeovimInstance {
         mut cmd: Command,
     ) -> Result<(BoxedReader, BoxedWriter, Option<BoxedReader>, Option<Child>)> {
         log::debug!("Starting neovim with: {cmd:?}");
+        let mut child =
+            cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+        let reader =
+            Box::new(child.stdout.take().ok_or_else(|| Error::other("Can't open stdout"))?);
+        let writer = Box::new(child.stdin.take().ok_or_else(|| Error::other("Can't open stdin"))?);
 
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let reader = Box::new(
-            child
-                .stdout
-                .take()
-                .ok_or_else(|| Error::other("Can't open stdout"))?,
-        );
-        let writer = Box::new(
-            child
-                .stdin
-                .take()
-                .ok_or_else(|| Error::other("Can't open stdin"))?,
-        );
-
-        let stderr_reader = Box::new(
-            child
-                .stderr
-                .take()
-                .ok_or_else(|| Error::other("Can't open stderr"))?,
-        );
+        let stderr_reader =
+            Box::new(child.stderr.take().ok_or_else(|| Error::other("Can't open stderr"))?);
 
         Ok((reader, writer, Some(stderr_reader), Some(child)))
     }
@@ -174,6 +163,33 @@ impl NeovimInstance {
                 ErrorKind::Unsupported,
                 "Unix Domain Sockets and Named Pipes are not supported on this platform",
             ))
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn forward_stdin(&self) -> Option<rustix::fd::OwnedFd> {
+        use rustix::fs::{FileType, fstat};
+        use std::os::fd::AsFd;
+
+        // stdin should be forwarded only in embedded mode when stdio is piped or redirected
+        match self {
+            Self::Embedded(..) => {
+                let stdin = std::io::stdin();
+                let should_forward = fstat(stdin.as_fd())
+                    .map(|stat| match FileType::from_raw_mode(stat.st_mode) {
+                        FileType::RegularFile => true,
+                        #[cfg(not(target_os = "wasi"))]
+                        FileType::Fifo | FileType::Socket => true,
+                        _ => false,
+                    })
+                    .unwrap_or(false);
+
+                // We have to use rustix here, since the Rust standard library currently sets O_CLOEXEC
+                // on all file handles. And there's no way to pass file handles to subprocesses.
+                // See [Tracking Issue for std::os::fd::CommandExt::fd](https://github.com/rust-lang/rust/issues/144989)
+                should_forward.then(|| rustix::io::dup(stdin).ok()).flatten()
+            }
+            Self::Server { .. } => None,
         }
     }
 

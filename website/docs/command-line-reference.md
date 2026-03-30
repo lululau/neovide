@@ -46,7 +46,7 @@ Can be set to:
 ### Window Size
 
 ```sh
---size=<width>x<height>
+--size=<width>x<height> or $NEOVIDE_SIZE=<width>x<height>
 ```
 
 Sets the initial neovide window size in pixels.
@@ -70,7 +70,7 @@ Can not be used together with `--size`, or `--grid`.
 ### Grid Size
 
 ```sh
---grid [<columns>x<lines>]
+--grid [<columns>x<lines>] or $NEOVIDE_GRID=<columns>x<lines>
 
 ```
 
@@ -160,6 +160,16 @@ to its generalistic purpose.
 
 This sets the window title to be hidden on macOS.
 
+### Application Icon
+
+```sh
+--icon <path>
+```
+
+**Nightly.**
+
+This sets a custom application icon. A default icon is bundled with Neovide.
+
 ### sRGB
 
 ```sh
@@ -201,6 +211,70 @@ tabs to avoid confusing new users. `--no-tabs` disables this behavior.
 Note: Even if files are opened in tabs, they're buffers anyways. It's just about them being visible
 or not.
 
+### Reuse Existing Instance (macOS Only)
+
+```sh
+--reuse-instance
+```
+
+**Nightly.**
+
+If another Neovide instance is already running, it forwards the file-open request to that
+instance instead of starting a second app process.
+
+If no handoff listener is running, it falls back to normal startup and opens a fresh instance.
+
+This handoff path is skipped when `--server` is set, so `--reuse-instance --server <address>`
+connects using the normal server flow instead of reusing an existing neovide instance.
+
+When the request is forwarded, `--tabs` and `--no-tabs` still apply to the files being opened in
+the reused instance.
+
+If `--chdir <path>` is also set, the reused instance receives that path as the target working
+directory for the request. Relative file paths are still resolved from the caller's current working
+directory before they are forwarded.
+
+### New Window (macOS Only)
+
+```sh
+--new-window
+```
+
+**Nightly.**
+
+Requires `--reuse-instance`
+
+When used together with `--reuse-instance`, Neovide asks the running instance to create a new OS
+window before opening the requested files.
+
+If no handoff listener is running, Neovide falls back to normal startup. In that case,
+`--new-window` has no separate effect beyond the normal launch.
+
+`--tabs`, `--no-tabs` and `--chdir <path>` still apply to the forwarded request in the same way
+as with `--reuse-instance` works.
+
+### System Native Tabs
+
+```sh
+--no-system-native-tabs, --system-native-tabs or $NEOVIDE_SYSTEM_NATIVE_TABS=0|1
+```
+
+Neovide merges macOS windows into a single host window automatically and hides the native tab bar by
+default to mimic a standalone window. Enable this option to keep the tab bar visible so every window
+shows up as a tab immediately. The setting applies to windows opened through both global shortcuts
+and the Editors menu entry.
+
+### System Tab Navigation
+
+```sh
+--system-tab-prev-hotkey <combo> or $NEOVIDE_SYSTEM_TAB_PREV_HOTKEY
+--system-tab-next-hotkey <combo> or $NEOVIDE_SYSTEM_TAB_NEXT_HOTKEY
+```
+
+When `system-native-tabs` is enabled, these shortcuts let you remap the in-app tab cycling keys
+(defaults: `cmd+shift+[` / `cmd+shift+]`). Set them to `false` or leave empty to
+pass the keypress through to Neovim instead.
+
 ### OpenGL Renderer
 
 ```sh
@@ -226,7 +300,7 @@ will be used.
 ### Neovim Server
 
 ```sh
---server <ADDRESS>
+--server <ADDRESS> or $NEOVIDE_SERVER=<ADDRESS>
 ```
 
 Connects to the named pipe or socket at ADDRESS.
@@ -259,3 +333,16 @@ permission bit set.
 
 On Linux/Unix, this alters the identification of the window to either X11 or the more modern
 Wayland, depending on what you are running on.
+
+### Working Directory
+
+```sh
+--chdir <path> or $NEOVIDE_CHDIR
+```
+
+**Nightly.**
+
+Start neovim in the specified working directory. This will impact neovim
+arguments that use relative path names (e.g. file names), and the initial
+working directory for all instances of neovim or terminal. This value can
+also be set via the `chdir` entry in the [Neovide Config File](config-file.md).

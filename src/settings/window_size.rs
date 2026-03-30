@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use log::{error, warn};
 use serde::{Deserialize, Serialize};
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 
@@ -9,18 +10,9 @@ use crate::{
 
 const SETTINGS_FILE: &str = "neovide-settings.json";
 
-pub const DEFAULT_GRID_SIZE: GridSize<u32> = GridSize {
-    width: 100,
-    height: 50,
-};
-pub const MIN_GRID_SIZE: GridSize<u32> = GridSize {
-    width: 20,
-    height: 6,
-};
-pub const MAX_GRID_SIZE: GridSize<u32> = GridSize {
-    width: 10000,
-    height: 1000,
-};
+pub const DEFAULT_GRID_SIZE: GridSize<u32> = GridSize { width: 100, height: 50 };
+pub const MIN_GRID_SIZE: GridSize<u32> = GridSize { width: 20, height: 6 };
+pub const MAX_GRID_SIZE: GridSize<u32> = GridSize { width: 10000, height: 1000 };
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum PersistentWindowSettings {
@@ -56,7 +48,12 @@ fn load_settings() -> Result<PersistentSettings, String> {
 }
 
 pub fn neovide_std_datapath() -> PathBuf {
-    dirs::data_local_dir().unwrap().join("neovide")
+    dirs::data_local_dir()
+        .unwrap_or_else(|| {
+            warn!("Could not determine local data directory, falling back to current directory");
+            PathBuf::from(".")
+        })
+        .join("neovide")
 }
 
 pub fn load_last_window_settings() -> Result<PersistentWindowSettings, String> {
@@ -68,10 +65,13 @@ pub fn load_last_window_settings() -> Result<PersistentWindowSettings, String> {
 }
 
 pub fn save_window_size(window_wrapper: &WinitWindowWrapper, settings: &Settings) {
-    if window_wrapper.skia_renderer.is_none() {
+    if window_wrapper.routes.is_empty() {
         return;
     }
-    let window = window_wrapper.skia_renderer.as_ref().unwrap().window();
+    let window_id = window_wrapper.get_focused_route().unwrap();
+    let route = window_wrapper.routes.get(&window_id).unwrap();
+    let window = route.window.winit_window.clone();
+
     // Don't save the window size when the window is minimized, since the size can be 0
     // Note wayland can't determine this
     if window.is_minimized() == Some(true) {
@@ -104,11 +104,24 @@ pub fn save_window_size(window_wrapper: &WinitWindowWrapper, settings: &Settings
     };
 
     let settings_path = settings_path();
-    std::fs::create_dir_all(neovide_std_datapath()).unwrap();
-    let json = serde_json::to_string(&settings).unwrap();
+
+    if let Err(write_error) = std::fs::create_dir_all(neovide_std_datapath()) {
+        error!("Could not create settings directory: {write_error}");
+        return;
+    }
+
+    let json = match serde_json::to_string(&settings) {
+        Ok(json) => json,
+        Err(serialize_error) => {
+            error!("Could not serialize window settings: {serialize_error}");
+            return;
+        }
+    };
+
     log::debug!("Saved Window Settings: {json}");
-    std::fs::write(&settings_path, json)
-        .unwrap_or_else(|_| panic!("Can't write to {settings_path:?}"));
+    if let Err(write_error) = std::fs::write(&settings_path, json) {
+        error!("Can't write to {settings_path:?}: {write_error}");
+    }
 }
 
 pub fn clamped_grid_size(grid_size: &GridSize<u32>) -> GridSize<u32> {

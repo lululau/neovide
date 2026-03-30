@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{rc::Rc, sync::Arc};
 
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_app_kit::NSColorSpace;
@@ -9,20 +9,20 @@ use objc2_metal::{
 };
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use skia_safe::{
+    Canvas, ColorSpace, ColorType, Surface, SurfaceProps, SurfacePropsFlags,
     gpu::{
-        self,
+        self, DirectContext, SurfaceOrigin,
         mtl::{BackendContext, TextureInfo},
         surfaces::wrap_backend_render_target,
-        DirectContext, SurfaceOrigin,
     },
-    Canvas, ColorSpace, ColorType, PixelGeometry, Surface, SurfaceProps, SurfacePropsFlags,
 };
 use winit::{event_loop::EventLoopProxy, window::Window};
 
 use crate::{
+    platform::macos::get_ns_window,
     profiling::tracy_gpu_zone,
     renderer::{RendererSettings, SkiaRenderer, VSync},
-    window::{macos::get_ns_window, UserEvent},
+    window::EventPayload,
 };
 
 use super::Settings;
@@ -40,7 +40,7 @@ impl MetalDrawableSurface {
     ) -> MetalDrawableSurface {
         tracy_gpu_zone!("MetalDrawableSurface.new");
 
-        let texture = unsafe { drawable.texture() };
+        let texture = drawable.texture();
         let texture_info = unsafe { TextureInfo::new(Retained::as_ptr(&texture).cast()) };
         let backend_render_target = gpu::backend_render_targets::make_mtl(
             (texture.width() as i32, texture.height() as i32),
@@ -51,7 +51,7 @@ impl MetalDrawableSurface {
 
         let surface_props = SurfaceProps::new_with_text_properties(
             SurfacePropsFlags::default(),
-            PixelGeometry::default(),
+            render_settings.pixel_geometry.into(),
             render_settings.text_contrast,
             render_settings.text_gamma,
         );
@@ -75,7 +75,7 @@ impl MetalDrawableSurface {
 }
 
 pub struct MetalSkiaRenderer {
-    window: Window,
+    window: Rc<Window>,
     _device: Retained<ProtocolObject<dyn MTLDevice>>,
     command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     metal_layer: Retained<CAMetalLayer>,
@@ -86,26 +86,20 @@ pub struct MetalSkiaRenderer {
 }
 
 impl MetalSkiaRenderer {
-    pub fn new(window: Window, srgb: bool, vsync: bool, settings: Arc<Settings>) -> Self {
+    pub fn new(window: Rc<Window>, srgb: bool, vsync: bool, settings: Arc<Settings>) -> Self {
         log::info!("Initialize MetalSkiaRenderer...");
 
         let draw_size = window.inner_size();
         let ns_window = get_ns_window(&window);
 
-        unsafe {
-            ns_window.setColorSpace(Some(
-                if srgb {
-                    NSColorSpace::sRGBColorSpace()
-                } else {
-                    NSColorSpace::deviceRGBColorSpace()
-                }
+        ns_window.setColorSpace(Some(
+            if srgb { NSColorSpace::sRGBColorSpace() } else { NSColorSpace::deviceRGBColorSpace() }
                 .as_ref(),
-            ));
-        }
+        ));
 
         let device =
             MTLCreateSystemDefaultDevice().expect("Failed to create Metal system default device.");
-        let metal_layer = unsafe {
+        let metal_layer = {
             let metal_layer = CAMetalLayer::new();
             metal_layer.setDevice(Some(&device));
             metal_layer.setPresentsWithTransaction(false);
@@ -122,9 +116,7 @@ impl MetalSkiaRenderer {
             metal_layer
         };
 
-        let command_queue = device
-            .newCommandQueue()
-            .expect("Failed to create command queue.");
+        let command_queue = device.newCommandQueue().expect("Failed to create command queue.");
 
         let backend = unsafe {
             BackendContext::new(
@@ -150,23 +142,18 @@ impl MetalSkiaRenderer {
     fn move_to_next_frame(&mut self) {
         tracy_gpu_zone!("move_to_next_frame");
 
-        let drawable = unsafe {
-            self.metal_layer
-                .nextDrawable()
-                .expect("Failed to get next drawable of metal layer.")
+        let drawable = {
+            self.metal_layer.nextDrawable().expect("Failed to get next drawable of metal layer.")
         };
 
-        self.metal_drawable_surface = Some(MetalDrawableSurface::new(
-            drawable,
-            &mut self.context,
-            &self.settings,
-        ));
+        self.metal_drawable_surface =
+            Some(MetalDrawableSurface::new(drawable, &mut self.context, &self.settings));
     }
 }
 
 impl SkiaRenderer for MetalSkiaRenderer {
-    fn window(&self) -> &Window {
-        &self.window
+    fn window(&self) -> Rc<Window> {
+        Rc::clone(&self.window)
     }
 
     fn flush(&mut self) {
@@ -178,15 +165,10 @@ impl SkiaRenderer for MetalSkiaRenderer {
     fn swap_buffers(&mut self) {
         tracy_gpu_zone!("swap buffers");
 
-        let command_buffer = self
-            .command_queue
-            .commandBuffer()
-            .expect("Failed to create command buffer.");
+        let command_buffer =
+            self.command_queue.commandBuffer().expect("Failed to create command buffer.");
         command_buffer.presentDrawable(
-            self.metal_drawable_surface
-                .as_mut()
-                .expect("No drawable surface now.")
-                .mtl_drawable(),
+            self.metal_drawable_surface.as_mut().expect("No drawable surface now.").mtl_drawable(),
         );
         command_buffer.commit();
 
@@ -209,17 +191,15 @@ impl SkiaRenderer for MetalSkiaRenderer {
         tracy_gpu_zone!("resize");
 
         let window_size = self.window.inner_size();
-        unsafe {
-            self.metal_layer.setDrawableSize(CGSize::new(
-                window_size.width as CGFloat,
-                window_size.height as CGFloat,
-            ));
-        }
+        self.metal_layer.setDrawableSize(CGSize::new(
+            window_size.width as CGFloat,
+            window_size.height as CGFloat,
+        ));
 
         self.window.request_redraw();
     }
 
-    fn create_vsync(&self, _proxy: EventLoopProxy<UserEvent>) -> VSync {
+    fn create_vsync(&self, _proxy: EventLoopProxy<EventPayload>) -> VSync {
         VSync::MacosMetal()
     }
 }

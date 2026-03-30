@@ -22,12 +22,16 @@ mod dimensions;
 mod editor;
 mod error_handling;
 mod frame;
+#[cfg(target_os = "macos")]
+mod ipc;
+mod platform;
 mod profiling;
 mod renderer;
 mod running_tracker;
 mod settings;
 mod units;
 mod utils;
+mod version;
 mod window;
 
 #[cfg(target_os = "windows")]
@@ -38,47 +42,54 @@ extern crate derive_new;
 
 use std::{
     env::{self, args},
-    fs::{create_dir_all, File, OpenOptions},
+    fs::{File, OpenOptions, create_dir_all},
     io::Write,
-    panic::set_hook,
+    path::PathBuf,
     process::ExitCode,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::SystemTime,
 };
 
 use anyhow::Result;
 use log::trace;
-use std::env::var;
-use std::panic::PanicHookInfo;
-use std::path::PathBuf;
-use time::macros::format_description;
-use time::OffsetDateTime;
+use std::panic::{PanicHookInfo, set_hook};
+use time::{OffsetDateTime, macros::format_description};
 use winit::{error::EventLoopError, event_loop::EventLoopProxy};
 
 #[cfg(not(test))]
 use flexi_logger::{Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
 
 use backtrace::Backtrace;
-use bridge::NeovimRuntime;
 use cmd_line::CmdLineSettings;
 use error_handling::handle_startup_errors;
-use renderer::{cursor_renderer::CursorSettings, RendererSettings};
-use running_tracker::RunningTracker;
+use renderer::{
+    RendererSettings, cursor_renderer::CursorSettings, progress_bar::ProgressBarSettings,
+};
+use version::BUILD_VERSION;
 use window::{
-    create_event_loop, determine_window_size, UpdateLoop, UserEvent, WindowSettings, WindowSize,
+    Application, EventPayload, WindowSettings, create_event_loop, determine_grid_size,
+    determine_window_size,
 };
 
 pub use channel_utils::*;
 #[cfg(target_os = "windows")]
 pub use windows_utils::*;
 
-use crate::settings::{load_last_window_settings, Config, PersistentWindowSettings, Settings};
+use crate::settings::{Config, Settings, load_last_window_settings};
+
+#[cfg(target_os = "macos")]
+use crate::utils::resolved_cwd;
 
 pub use profiling::startup_profiler;
+
+#[cfg(target_os = "macos")]
+use crate::frame::Frame;
 
 const DEFAULT_BACKTRACES_FILE: &str = "neovide_backtraces.log";
 const BACKTRACES_FILE_ENV_VAR: &str = "NEOVIDE_BACKTRACES";
 const REQUEST_MESSAGE: &str = "This is a bug and we would love for it to be reported to https://github.com/neovide/neovide/issues";
+#[cfg(not(target_os = "windows"))]
+const FORKED_FROM_TTY_ENV_VAR: &str = "NEOVIDE_FORKED_FROM_TTY";
 
 fn main() -> ExitCode {
     set_hook(Box::new(|panic_info| {
@@ -100,48 +111,56 @@ fn main() -> ExitCode {
     env::remove_var("ARGV0");
 
     let event_loop = create_event_loop();
-    clipboard::init(&event_loop);
-
-    let running_tracker = RunningTracker::new();
+    let clipboard = clipboard::Clipboard::new(&event_loop);
+    let clipboard_handle = clipboard::ClipboardHandle::new(&clipboard);
     let settings = Arc::new(Settings::new());
+    let setup_proxy = event_loop.create_proxy();
+    let config = match setup(setup_proxy, settings.clone()) {
+        Ok(config) => config,
+        Err(err) => return handle_startup_errors(err, event_loop, settings.clone(), clipboard),
+    };
 
-    match setup(
+    // Set BgColor by default when using a transparent frame, so the titlebar text gets correct
+    // color.
+    #[cfg(target_os = "macos")]
+    if settings.get::<CmdLineSettings>().frame == Frame::Transparent {
+        let mut window_settings = settings.get::<WindowSettings>();
+        window_settings.theme = window::ThemeSettings::BgColor;
+        settings.set(&window_settings);
+    }
+
+    let window_settings = load_last_window_settings().ok();
+    let window_size = determine_window_size(window_settings.as_ref(), &settings);
+    let grid_size = determine_grid_size(&window_size, window_settings);
+
+    let mut application = Application::new(
+        window_size,
+        grid_size,
+        config.font,
         event_loop.create_proxy(),
-        running_tracker.clone(),
         settings.clone(),
-    ) {
-        Err(err) => handle_startup_errors(err, event_loop, settings.clone()),
-        Ok((window_size, initial_config, runtime)) => {
-            let mut update_loop = UpdateLoop::new(
-                window_size,
-                initial_config,
-                event_loop.create_proxy(),
-                settings.clone(),
-            );
+        clipboard,
+        clipboard_handle,
+    );
 
-            let result = event_loop.run_app(&mut update_loop);
-
-            // Wait a little bit more and force Nevoim to exit after that.
-            // This should not be required, but Neovim through libuv spawns childprocesses that inherits all the handles
-            // This means that the stdio and stderr handles are not properly closed, so the nvim-rs
-            // read will hang forever, waiting for more data to read.
-            // See https://github.com/neovide/neovide/issues/2182 (which includes links to libuv issues)
-            runtime.runtime.shutdown_timeout(Duration::from_millis(500));
-
-            match result {
-                Ok(_) => running_tracker.exit_code(),
-                Err(EventLoopError::ExitFailure(code)) => ExitCode::from(code as u8),
-                _ => ExitCode::FAILURE,
-            }
+    #[cfg(target_os = "macos")]
+    let _handoff_listener = match ipc::handoff::start_listener(event_loop.create_proxy()) {
+        Ok(listener) => Some(listener),
+        Err(error) => {
+            log::warn!("failed to start handoff listener: {error:#}");
+            None
         }
+    };
+
+    let result = application.run(event_loop);
+    match result {
+        Ok(_) => application.runtime_tracker.exit_code(),
+        Err(EventLoopError::ExitFailure(code)) => ExitCode::from(code as u8),
+        _ => ExitCode::FAILURE,
     }
 }
 
-fn setup(
-    proxy: EventLoopProxy<UserEvent>,
-    running_tracker: RunningTracker,
-    settings: Arc<Settings>,
-) -> Result<(WindowSize, Config, NeovimRuntime)> {
+fn setup(proxy: EventLoopProxy<EventPayload>, settings: Arc<Settings>) -> Result<Config> {
     //  --------------
     // | Architecture |
     //  --------------
@@ -214,6 +233,7 @@ fn setup(
     settings.register::<WindowSettings>();
     settings.register::<RendererSettings>();
     settings.register::<CursorSettings>();
+    settings.register::<ProgressBarSettings>();
 
     let config = Config::init();
     Config::watch_config_file(config.clone(), proxy.clone());
@@ -232,6 +252,18 @@ fn setup(
 
     //Will exit if -h or -v
     cmd_line::handle_command_line_arguments(args().collect(), settings.as_ref())?;
+    {
+        let cmdline_settings = settings.get::<CmdLineSettings>();
+        if let Some(status) = cmd_line::maybe_passthrough_to_neovim(&cmdline_settings)? {
+            std::process::exit(cmd_line::exit_status_code(status));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    match maybe_handoff(settings.as_ref()) {
+        HandoffOutcome::Continue => {}
+        HandoffOutcome::Exit => std::process::exit(0),
+        HandoffOutcome::Error(error) => return Err(anyhow::anyhow!(error)),
+    }
     #[cfg(not(target_os = "windows"))]
     maybe_disown(&settings);
 
@@ -240,24 +272,47 @@ fn setup(
     #[cfg(not(test))]
     init_logger(&settings);
 
-    trace!("Neovide version: {}", crate_version!());
+    trace!("Neovide version: {}", BUILD_VERSION);
 
-    let window_settings = load_last_window_settings().ok();
-    let window_size = determine_window_size(window_settings.as_ref(), &settings);
-    let grid_size = match window_size {
-        WindowSize::Grid(grid_size) => Some(grid_size),
-        // Clippy wrongly suggests to use unwrap or default here
-        #[allow(clippy::manual_unwrap_or_default)]
-        _ => match window_settings {
-            Some(PersistentWindowSettings::Maximized { grid_size, .. }) => grid_size,
-            Some(PersistentWindowSettings::Windowed { grid_size, .. }) => grid_size,
-            _ => None,
-        },
+    Ok(config)
+}
+
+#[cfg(target_os = "macos")]
+enum HandoffOutcome {
+    Continue,
+    Exit,
+    Error(String),
+}
+
+#[cfg(target_os = "macos")]
+fn maybe_handoff(settings: &Settings) -> HandoffOutcome {
+    let cmdline_settings = settings.get::<CmdLineSettings>();
+    if !cmdline_settings.reuse_instance
+        || cmdline_settings.server.is_some()
+        || (cmdline_settings.files_to_open.is_empty() && !cmdline_settings.new_window)
+    {
+        return HandoffOutcome::Continue;
+    }
+
+    let request = ipc::handoff::HandoffRequest {
+        version: BUILD_VERSION.to_owned(),
+        files_to_open: cmdline_settings.files_to_open.clone(),
+        cwd: resolved_cwd(cmd_line::argv_chdir().as_deref()),
+        caller_cwd: resolved_cwd(None),
+        tabs: cmdline_settings.tabs,
+        new_window: cmdline_settings.new_window,
     };
 
-    let mut runtime = NeovimRuntime::new()?;
-    runtime.launch(proxy, grid_size, running_tracker, settings)?;
-    Ok((window_size, config, runtime))
+    match ipc::handoff::try_handoff(&request) {
+        ipc::handoff::HandoffResult::Accepted => HandoffOutcome::Exit,
+        ipc::handoff::HandoffResult::NoListener => HandoffOutcome::Continue,
+        ipc::handoff::HandoffResult::Rejected(error) => {
+            HandoffOutcome::Error(format!("reuse-instance request was rejected: {error}"))
+        }
+        ipc::handoff::HandoffResult::Failed(error) => {
+            HandoffOutcome::Error(format!("reuse-instance request failed: {error}"))
+        }
+    }
 }
 
 #[cfg(not(test))]
@@ -268,11 +323,7 @@ pub fn init_logger(settings: &Settings) {
         Logger::try_with_env_or_str("neovide")
             .expect("Could not init logger")
             .log_to_file(FileSpec::default())
-            .rotate(
-                Criterion::Size(10_000_000),
-                Naming::Timestamps,
-                Cleanup::KeepLogFiles(1),
-            )
+            .rotate(Criterion::Size(10_000_000), Naming::Timestamps, Cleanup::KeepLogFiles(1))
             .duplicate_to_stderr(Duplicate::Error)
     } else {
         Logger::try_with_env_or_str("neovide = error").expect("Could not init logger")
@@ -292,18 +343,28 @@ fn maybe_disown(settings: &Settings) {
         return;
     }
 
-    if let Ok(current_exe) = env::current_exe() {
-        assert!(process::Command::new(current_exe)
-            .stdin(process::Stdio::null())
-            .stdout(process::Stdio::null())
-            .stderr(process::Stdio::null())
-            .args(env::args().skip(1))
-            .spawn()
-            .is_ok());
-        process::exit(0);
-    } else {
-        eprintln!("error in disowning process, cannot obtain the path for the current executable, continuing without disowning...");
-    }
+    match fork::daemon(true, false) {
+        Ok(fork::Fork::Parent(_)) => process::exit(0),
+        Ok(fork::Fork::Child) => {
+            if let Ok(current_exe) = env::current_exe() {
+                let mut command = process::Command::new(current_exe);
+                command
+                    .stdin(process::Stdio::null())
+                    .stdout(process::Stdio::null())
+                    .stderr(process::Stdio::null())
+                    .args(env::args().skip(1));
+                command.env(FORKED_FROM_TTY_ENV_VAR, "1");
+                assert!(command.spawn().is_ok());
+                process::exit(0);
+            } else {
+                eprintln!(
+                    "error in disowning process, cannot obtain the respawn context, exiting..."
+                );
+                process::exit(1);
+            }
+        }
+        Err(_) => eprintln!("error in disowning process, continuing without disowning..."),
+    };
 }
 
 fn generate_stderr_log_message(panic_info: &PanicHookInfo, backtrace: &Backtrace) -> String {
@@ -335,7 +396,7 @@ fn log_panic_to_file(panic_info: &PanicHookInfo, backtrace: &Backtrace, path: &O
 
     let file_path = match path {
         Some(v) => v,
-        None => &match var(BACKTRACES_FILE_ENV_VAR) {
+        None => &match env::var(BACKTRACES_FILE_ENV_VAR) {
             Ok(v) => PathBuf::from(v),
             Err(_) => settings::neovide_std_datapath().join(DEFAULT_BACKTRACES_FILE),
         },
@@ -367,9 +428,7 @@ fn generate_panic_log_message(panic_info: &PanicHookInfo, backtrace: &Backtrace)
     let system_time: OffsetDateTime = SystemTime::now().into();
 
     let timestamp = system_time
-        .format(format_description!(
-            "[year]-[month]-[day] [hour]:[minute]:[second]"
-        ))
+        .format(format_description!("[year]-[month]-[day] [hour]:[minute]:[second]"))
         .expect("Failed to parse current time");
 
     let partial_panic_msg = generate_panic_message(panic_info);
@@ -398,5 +457,7 @@ fn generate_panic_message(panic_info: &PanicHookInfo) -> String {
         None => return "Could not parse panic payload to a string. This is a bug.".to_owned(),
     };
 
-    format!("Neovide panicked with the message '{payload}'. (File: {file}; Line: {line}, Column: {column})")
+    format!(
+        "Neovide panicked with the message '{payload}'. (File: {file}; Line: {line}, Column: {column})"
+    )
 }

@@ -5,8 +5,9 @@ pub mod fonts;
 pub mod grid_renderer;
 pub mod opengl;
 pub mod profiler;
+pub mod progress_bar;
 mod rendered_layer;
-mod rendered_window;
+pub mod rendered_window;
 mod vsync;
 
 #[cfg(target_os = "windows")]
@@ -17,13 +18,14 @@ mod metal;
 
 use std::{
     cmp::Ordering,
-    collections::{hash_map::Entry, HashMap},
+    collections::{HashMap, hash_map::Entry},
+    rc::Rc,
     sync::Arc,
 };
 
 use itertools::Itertools;
-use log::error;
-use skia_safe::Canvas;
+use progress_bar::{ProgressBar, ProgressBarSettings};
+use skia_safe::{Canvas, Color4f, Paint};
 
 use winit::{
     event::WindowEvent,
@@ -32,15 +34,18 @@ use winit::{
 };
 
 use crate::{
+    WindowSettings,
     bridge::EditorMode,
     cmd_line::CmdLineSettings,
     editor::{Cursor, Style, WindowType},
     profiling::{tracy_create_gpu_context, tracy_named_frame, tracy_zone},
-    renderer::rendered_layer::{group_windows, FloatingLayer},
+    renderer::{
+        fonts::font_options::PixelGeometry,
+        rendered_layer::{FloatingLayer, group_windows},
+    },
     settings::*,
-    units::{to_skia_rect, GridRect, GridSize, PixelPos},
-    window::{ShouldRender, UserEvent},
-    WindowSettings,
+    units::{GridPos, GridRect, GridScale, GridSize, PixelPos, PixelRect, to_skia_rect},
+    window::{EventPayload, ShouldRender},
 };
 
 #[cfg(feature = "profiling")]
@@ -58,11 +63,20 @@ use crate::profiling::GpuCtx;
 use cursor_renderer::CursorRenderer;
 pub use fonts::caching_shaper::CachingShaper;
 pub use grid_renderer::GridRenderer;
-pub use rendered_window::{LineFragment, RenderedWindow, WindowDrawCommand, WindowDrawDetails};
+pub use rendered_window::{RenderedWindow, WindowDrawCommand, WindowDrawDetails};
 
 pub use vsync::VSync;
 
 use self::fonts::font_options::FontOptions;
+
+const MESSAGE_SELECTION_ALPHA: f32 = 0.35;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct MessageSelection {
+    pub grid_id: u64,
+    pub start: GridPos<u32>,
+    pub end: GridPos<u32>,
+}
 
 #[cfg(feature = "profiling")]
 fn plot_skia_cache() {
@@ -70,14 +84,8 @@ fn plot_skia_cache() {
     tracy_plot!("font_cache_used", font_cache_used() as f64);
     tracy_plot!("font_cache_count_used", font_cache_count_used() as f64);
     tracy_plot!("font_cache_count_limit", font_cache_count_limit() as f64);
-    tracy_plot!(
-        "resource_cache_total_bytes_used",
-        resource_cache_total_bytes_used() as f64
-    );
-    tracy_plot!(
-        "resource_cache_total_bytes_limit",
-        resource_cache_total_bytes_limit() as f64
-    );
+    tracy_plot!("resource_cache_total_bytes_used", resource_cache_total_bytes_used() as f64);
+    tracy_plot!("resource_cache_total_bytes_limit", resource_cache_total_bytes_limit() as f64);
     tracy_plot!(
         "resource_cache_single_allocation_byte_limit",
         resource_cache_single_allocation_byte_limit().unwrap_or_default() as f64
@@ -103,6 +111,7 @@ pub struct RendererSettings {
     text_gamma: f32,
     text_contrast: f32,
     experimental_layer_grouping: bool,
+    pixel_geometry: PixelGeometry,
 }
 
 impl Default for RendererSettings {
@@ -125,6 +134,7 @@ impl Default for RendererSettings {
             text_gamma: 0.0,
             text_contrast: 0.5,
             experimental_layer_grouping: false,
+            pixel_geometry: PixelGeometry::default(),
         }
     }
 }
@@ -134,7 +144,7 @@ impl Default for RendererSettings {
 // window) are sorted as larger than the ones that should be handled later
 // So the order of the variants here matters so that the derive implementation can get
 // the order in the binary heap correct
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DrawCommand {
     UpdateCursor(Cursor),
     FontChanged(String),
@@ -142,11 +152,7 @@ pub enum DrawCommand {
     DefaultStyleChanged(Style),
     ModeChanged(EditorMode),
     UIReady,
-    Window {
-        grid_id: u64,
-        command: WindowDrawCommand,
-    },
-    CloseWindow(u64),
+    Window { grid_id: u64, command: WindowDrawCommand },
 }
 
 pub struct Renderer {
@@ -154,7 +160,9 @@ pub struct Renderer {
     pub grid_renderer: GridRenderer,
     current_mode: EditorMode,
 
-    rendered_windows: HashMap<u64, RenderedWindow>,
+    pub progress_bar: ProgressBar,
+
+    pub rendered_windows: HashMap<u64, RenderedWindow>,
     pub window_regions: Vec<WindowDrawDetails>,
 
     profiler: profiler::Profiler,
@@ -162,6 +170,7 @@ pub struct Renderer {
     pub user_scale_factor: f64,
 
     settings: Arc<Settings>,
+    message_selection: Option<MessageSelection>,
 }
 
 /// Results of processing the draw commands from the command channel.
@@ -178,6 +187,9 @@ impl Renderer {
         let scale_factor = user_scale_factor * os_scale_factor;
         let cursor_renderer = CursorRenderer::new(settings.clone());
         let mut grid_renderer = GridRenderer::new(scale_factor, settings.clone());
+        let mut font_config_state = settings.get::<FontConfigState>();
+        font_config_state.has_font = init_config.font.is_some();
+        settings.set(&font_config_state);
         grid_renderer.update_font_options(init_config.font.map(|x| x.into()).unwrap_or_default());
         grid_renderer.handle_box_drawing_update(init_config.box_drawing.unwrap_or_default());
         let current_mode = EditorMode::Unknown(String::from(""));
@@ -187,6 +199,8 @@ impl Renderer {
 
         let profiler = profiler::Profiler::new(12.0, settings.clone());
 
+        let progress_bar = ProgressBar::new();
+
         Renderer {
             rendered_windows,
             cursor_renderer,
@@ -194,9 +208,11 @@ impl Renderer {
             current_mode,
             window_regions,
             profiler,
+            progress_bar,
             os_scale_factor,
             user_scale_factor,
             settings,
+            message_selection: None,
         }
     }
 
@@ -208,11 +224,20 @@ impl Renderer {
         self.grid_renderer.font_names()
     }
 
+    pub fn set_message_selection(&mut self, selection: Option<MessageSelection>) {
+        self.message_selection = selection;
+    }
+
     pub fn prepare_frame(&mut self) -> ShouldRender {
         self.cursor_renderer.prepare_frame()
     }
 
-    pub fn draw_frame(&mut self, root_canvas: &Canvas, dt: f32) {
+    pub fn draw_frame(
+        &mut self,
+        root_canvas: &Canvas,
+        content_region: Option<&PixelRect<f32>>,
+        dt: f32,
+    ) {
         tracy_zone!("renderer_draw_frame");
         let window_settings = self.settings.get::<WindowSettings>();
         let opacity = if window_settings.normal_opacity < 1.0 {
@@ -223,15 +248,14 @@ impl Renderer {
         let default_background = self.grid_renderer.get_default_background(opacity);
         let grid_scale = self.grid_renderer.grid_scale;
 
-        let layer_grouping = self
-            .settings
-            .get::<RendererSettings>()
-            .experimental_layer_grouping;
+        let layer_grouping = self.settings.get::<RendererSettings>().experimental_layer_grouping;
         root_canvas.clear(default_background);
         root_canvas.save();
         root_canvas.reset_matrix();
 
-        if let Some(root_window) = self.rendered_windows.get(&1) {
+        if let Some(content_region) = content_region {
+            root_canvas.clip_rect(to_skia_rect(content_region), None, Some(false));
+        } else if let Some(root_window) = self.rendered_windows.get(&1) {
             let clip_rect = to_skia_rect(&root_window.pixel_region(grid_scale));
             root_canvas.clip_rect(clip_rect, None, Some(false));
         }
@@ -307,31 +331,111 @@ impl Renderer {
         };
 
         let settings = self.settings.get::<RendererSettings>();
+        let max_root_x = max_window_max_x(&root_windows, grid_scale);
         let root_window_regions = root_windows
             .into_iter()
-            .map(|window| window.draw(root_canvas, default_background, grid_scale))
+            .map(|window| {
+                let region = window.pixel_region(grid_scale);
+                let rightmost_root_window = is_rightmost_window_edge(region.max.x, max_root_x);
+                window.draw(
+                    root_canvas,
+                    default_background,
+                    grid_scale,
+                    content_region.copied(),
+                    rightmost_root_window,
+                )
+            })
             .collect_vec();
 
         let floating_window_regions = floating_layers
             .into_iter()
             .flat_map(|mut layer| {
-                layer.draw(root_canvas, &settings, default_background, grid_scale)
+                layer.draw(
+                    root_canvas,
+                    &settings,
+                    default_background,
+                    grid_scale,
+                    content_region.copied(),
+                )
             })
             .collect_vec();
 
-        self.window_regions = root_window_regions
-            .into_iter()
-            .chain(floating_window_regions)
-            .collect();
-        self.cursor_renderer
-            .draw(&mut self.grid_renderer, root_canvas);
+        self.window_regions =
+            root_window_regions.into_iter().chain(floating_window_regions).collect();
+        self.draw_message_selection(root_canvas, grid_scale);
+        self.cursor_renderer.draw(&mut self.grid_renderer, root_canvas);
 
         self.profiler.draw(root_canvas, dt);
 
+        let grid_size = self.get_grid_size();
+
         root_canvas.restore();
+
+        let progress_bar_settings = self.settings.get::<ProgressBarSettings>();
+        self.progress_bar.draw(&progress_bar_settings, root_canvas, &self.grid_renderer, grid_size);
 
         #[cfg(feature = "profiling")]
         plot_skia_cache();
+    }
+
+    fn message_selection_window(&self) -> Option<(&MessageSelection, &RenderedWindow)> {
+        let selection = self.message_selection.as_ref()?;
+        let window = self.rendered_windows.get(&selection.grid_id)?;
+        if !matches!(window.window_type, WindowType::Message { .. }) {
+            return None;
+        }
+
+        Some((selection, window))
+    }
+
+    fn draw_message_selection(&mut self, root_canvas: &Canvas, grid_scale: GridScale) {
+        let Some((selection, window)) = self.message_selection_window() else {
+            return;
+        };
+
+        let height = window.grid_size.height;
+        let width = window.grid_size.width;
+        if height == 0 || width == 0 {
+            return;
+        }
+
+        let max_row = height - 1;
+        let max_col = width - 1;
+        let start_row = selection.start.y.min(max_row);
+        let end_row = selection.end.y.min(max_row);
+        let (row_start, row_end) =
+            if start_row <= end_row { (start_row, end_row) } else { (end_row, start_row) };
+
+        let start_col = selection.start.x.min(max_col);
+        let end_col = selection.end.x.min(max_col);
+        let (col_start, col_end) =
+            if start_col <= end_col { (start_col, end_col) } else { (end_col, start_col) };
+
+        let pixel_region = window.pixel_region(grid_scale);
+        root_canvas.save();
+        root_canvas.clip_rect(to_skia_rect(&pixel_region), None, Some(false));
+
+        let selection_color = self
+            .grid_renderer
+            .default_style
+            .colors
+            .foreground
+            .or(self.grid_renderer.default_style.colors.background)
+            .unwrap_or_else(|| Color4f::from(self.grid_renderer.get_default_background(1.0)));
+
+        let mut paint = Paint::new(selection_color, None);
+        paint.set_anti_alias(false);
+        paint.set_alpha_f(MESSAGE_SELECTION_ALPHA);
+
+        for row in row_start..=row_end {
+            let row_start_col = if row == row_start { col_start } else { 0 };
+            let row_end_col = if row == row_end { col_end } else { max_col };
+            if let Some(rect) = window.grid_row_rect(row, row_start_col, row_end_col, grid_scale) {
+                root_canvas.draw_rect(rect, &paint);
+            }
+        }
+
+        root_canvas.restore();
     }
 
     pub fn animate_frame(&mut self, grid_rect: &GridRect<f32>, dt: f32) -> bool {
@@ -356,45 +460,47 @@ impl Renderer {
         let settings = self.settings.get::<RendererSettings>();
         // Clippy recommends short-circuiting with any which is not what we want
         #[allow(clippy::unnecessary_fold)]
-        let mut animating = windows.fold(false, |acc, window| {
-            acc | window.animate(&settings, grid_rect, dt)
-        });
+        let mut animating =
+            windows.fold(false, |acc, window| acc | window.animate(&settings, grid_rect, dt));
 
         let windows = &self.rendered_windows;
         let grid_scale = self.grid_renderer.grid_scale;
-        self.cursor_renderer
-            .update_cursor_destination(grid_scale, windows);
+        self.cursor_renderer.update_cursor_destination(grid_scale, windows);
 
-        animating |= self
-            .cursor_renderer
-            .animate(&self.current_mode, &self.grid_renderer, dt);
+        animating |= self.cursor_renderer.animate(&self.current_mode, &self.grid_renderer, dt);
+
+        let progress_bar_settings = self.settings.get::<ProgressBarSettings>();
+        self.progress_bar.animate(&progress_bar_settings, dt);
+        animating |= self.progress_bar.is_animating();
 
         animating
     }
 
-    pub fn handle_config_changed(&mut self, config: HotReloadConfigs) {
+    pub fn handle_config_changed(&mut self, config: RendererHotReloadConfigs) {
         match config {
-            HotReloadConfigs::Font(font) => match font {
-                Some(font) => {
-                    self.grid_renderer.update_font_options(font.into());
+            RendererHotReloadConfigs::Font(font) => {
+                let font = *font;
+                let mut font_config_state = self.settings.get::<FontConfigState>();
+                font_config_state.has_font = font.is_some();
+                self.settings.set(&font_config_state);
+                match font {
+                    Some(font) => {
+                        self.grid_renderer.update_font_options(font.into());
+                    }
+                    None => {
+                        self.grid_renderer.update_font_options(FontOptions::default());
+                    }
                 }
-                None => {
-                    self.grid_renderer
-                        .update_font_options(FontOptions::default());
-                }
-            },
-            HotReloadConfigs::BoxDrawing(settings) => self
-                .grid_renderer
-                .handle_box_drawing_update(settings.unwrap_or_default()),
+            }
+            RendererHotReloadConfigs::BoxDrawing(settings) => {
+                self.grid_renderer.handle_box_drawing_update(settings.unwrap_or_default())
+            }
         }
     }
 
     pub fn handle_draw_commands(&mut self, batch: Vec<DrawCommand>) -> DrawCommandResult {
         let settings = self.settings.get::<RendererSettings>();
-        let mut result = DrawCommandResult {
-            font_changed: false,
-            should_show: false,
-        };
+        let mut result = DrawCommandResult { font_changed: false, should_show: false };
 
         for draw_command in batch {
             self.handle_draw_command(draw_command, &mut result);
@@ -420,10 +526,7 @@ impl Renderer {
 
     fn handle_draw_command(&mut self, draw_command: DrawCommand, result: &mut DrawCommandResult) {
         match draw_command {
-            DrawCommand::Window {
-                grid_id,
-                command: WindowDrawCommand::Close,
-            } => {
+            DrawCommand::Window { grid_id, command: WindowDrawCommand::Close } => {
                 self.rendered_windows.remove(&grid_id);
             }
             DrawCommand::Window { grid_id, command } => {
@@ -441,10 +544,10 @@ impl Renderer {
                         }
                         _ => {
                             let settings = self.settings.get::<CmdLineSettings>();
-                            // Ignore the errors when not using multigrid, since Neovim wrongly sends some of these
+                            // Neovim can emit draw commands before a window is positioned when using multigrid.
                             if !settings.no_multi_grid {
-                                error!(
-                                    "WindowDrawCommand: {command:?} sent for uninitialized grid {grid_id}"
+                                log::warn!(
+                                    "Ignoring {command:?} sent for uninitialized grid {grid_id}"
                                 );
                             }
                         }
@@ -471,14 +574,20 @@ impl Renderer {
             DrawCommand::UIReady => {
                 result.should_show = true;
             }
-            _ => {}
         }
     }
 
     pub fn flush(&mut self, renderer_settings: &RendererSettings) {
-        self.rendered_windows
-            .iter_mut()
-            .for_each(|(_, w)| w.flush(renderer_settings));
+        self.rendered_windows.iter_mut().for_each(|(_, w)| w.flush(renderer_settings));
+    }
+
+    pub fn clear(&mut self) {
+        self.rendered_windows.clear();
+        self.window_regions.clear();
+        self.cursor_renderer = CursorRenderer::new(self.settings.clone());
+        self.progress_bar = ProgressBar::new();
+        self.current_mode = EditorMode::Unknown(String::new());
+        self.message_selection = None;
     }
 
     pub fn get_cursor_destination(&self) -> PixelPos<f32> {
@@ -494,6 +603,17 @@ impl Renderer {
     }
 }
 
+pub fn is_rightmost_window_edge(region_max_x: f32, max_x: f32) -> bool {
+    max_x.is_finite() && (region_max_x - max_x).abs() <= f32::EPSILON
+}
+
+pub fn max_window_max_x(windows: &[&mut RenderedWindow], grid_scale: GridScale) -> f32 {
+    windows.iter().fold(f32::NEG_INFINITY, |max_x, window| {
+        let region = window.pixel_region(grid_scale);
+        max_x.max(region.max.x)
+    })
+}
+
 /// Defines how floating windows are sorted.
 fn floating_sort(window_a: &&mut RenderedWindow, window_b: &&mut RenderedWindow) -> Ordering {
     let orda = &window_a.anchor_info.as_ref().unwrap().sort_order;
@@ -501,6 +621,7 @@ fn floating_sort(window_a: &&mut RenderedWindow, window_b: &&mut RenderedWindow)
     orda.cmp(ordb)
 }
 
+#[derive(Clone)]
 pub enum WindowConfigType {
     OpenGL(glutin::config::Config),
     #[cfg(target_os = "windows")]
@@ -509,8 +630,9 @@ pub enum WindowConfigType {
     Metal,
 }
 
+#[derive(Clone)]
 pub struct WindowConfig {
-    pub window: Window,
+    pub window: Rc<Window>,
     pub config: WindowConfigType,
 }
 
@@ -526,7 +648,7 @@ pub fn build_window_config(
     } else {
         let window = event_loop.create_window(window_attributes).unwrap();
         let config = WindowConfigType::Metal;
-        WindowConfig { window, config }
+        WindowConfig { window: window.into(), config }
     }
 }
 
@@ -542,7 +664,7 @@ pub fn build_window_config(
     } else {
         let window = event_loop.create_window(window_attributes).unwrap();
         let config = WindowConfigType::Direct3D;
-        WindowConfig { window, config }
+        WindowConfig { window: window.into(), config }
     }
 }
 
@@ -556,36 +678,33 @@ pub fn build_window_config(
 }
 
 pub trait SkiaRenderer {
-    fn window(&self) -> &Window;
+    fn window(&self) -> Rc<Window>;
     fn flush(&mut self);
     fn swap_buffers(&mut self);
     fn canvas(&mut self) -> &Canvas;
     fn resize(&mut self);
-    fn create_vsync(&self, proxy: EventLoopProxy<UserEvent>) -> VSync;
+    fn create_vsync(&self, proxy: EventLoopProxy<EventPayload>) -> VSync;
     #[cfg(feature = "gpu_profiling")]
     fn tracy_create_gpu_context(&self, name: &str) -> Box<dyn GpuCtx>;
 }
 
 pub fn create_skia_renderer(
-    window: WindowConfig,
+    window: &WindowConfig,
     srgb: bool,
     vsync: bool,
     settings: Arc<Settings>,
 ) -> Box<dyn SkiaRenderer> {
     let renderer: Box<dyn SkiaRenderer> = match &window.config {
-        WindowConfigType::OpenGL(..) => Box::new(opengl::OpenGLSkiaRenderer::new(
-            window,
-            srgb,
-            vsync,
-            settings.clone(),
-        )),
+        WindowConfigType::OpenGL(..) => {
+            Box::new(opengl::OpenGLSkiaRenderer::new(window.clone(), srgb, vsync, settings.clone()))
+        }
         #[cfg(target_os = "windows")]
         WindowConfigType::Direct3D => {
-            Box::new(d3d::D3DSkiaRenderer::new(window.window, settings.clone()))
+            Box::new(d3d::D3DSkiaRenderer::new(window.window.clone(), settings.clone()))
         }
         #[cfg(target_os = "macos")]
         WindowConfigType::Metal => Box::new(metal::MetalSkiaRenderer::new(
-            window.window,
+            window.window.clone(),
             srgb,
             vsync,
             settings.clone(),

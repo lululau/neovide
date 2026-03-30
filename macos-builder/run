@@ -6,11 +6,23 @@ if [ -n "$1" ]; then
   TARGET_ARCHITECTURE=$1
 fi
 
+TARGET="neovide"
+
+if [ "$CLEAN_BUILD" == "true" ]; then
+  echo "Cleaning build artifacts..."
+  if [ -n "$TARGET_ARCHITECTURE" ]; then
+    cargo clean --target "${TARGET_ARCHITECTURE}"
+  else
+    cargo clean
+  fi
+fi
+
 RELEASE_DIR=${TARGET_ARCHITECTURE:+target/${TARGET_ARCHITECTURE}/release}
 RELEASE_DIR=${RELEASE_DIR:-target/release}
+RELEASE_BINARY="${RELEASE_DIR}/${TARGET}"
 
-if [ ! -d "${RELEASE_DIR}" ]; then
-  echo "Release directory '${RELEASE_DIR}' does not exist."
+if [ ! -f "${RELEASE_BINARY}" ]; then
+  echo "Release binary '${RELEASE_BINARY}' does not exist."
   echo "Running 'cargo build --release${TARGET_ARCHITECTURE:+ --target ${TARGET_ARCHITECTURE}}' ..."
   cargo build --release ${TARGET_ARCHITECTURE:+--target "${TARGET_ARCHITECTURE}"}
 fi
@@ -20,7 +32,6 @@ if [ -n "$2" ]; then
 fi
 
 DEVELOPER_ID=${DEVELOPER_ID:-""}
-TARGET="neovide"
 EXTRAS_DIR="extra"
 ASSETS_DIR="assets"
 BUNDLE_DIR="${RELEASE_DIR}/bundle"
@@ -36,6 +47,7 @@ DMG_NAME="Neovide${TARGET_ARCHITECTURE:+-${TARGET_ARCHITECTURE}}.dmg"
 DMG_VOLNAME="Neovide"
 DMG_FILESYSTEM="HFS+"
 DMG_FORMAT="UDZO"
+DMG_HDIUTIL_RETRIES=${DMG_HDIUTIL_RETRIES:-20}
 DMG_ICNS="${APP_EXTRAS_DIR}/Neovide.icns"
 DMG_BACKGROUND="${ASSETS_DIR}/neovide-dmg-background.tiff"
 
@@ -65,10 +77,16 @@ if [ "$GENERATE_BUNDLE_APP" == "true" ]; then
 fi
 
 if [ "$GENERATE_DMG" == "true" ]; then
+  if [ -f "${APP_DIR}/${DMG_NAME}" ]; then
+    echo "Removing existing DMG '${APP_DIR}/${DMG_NAME}'"
+    rm -f "${APP_DIR}/${DMG_NAME}"
+  fi
+
   # Make Neovide.dmg
   create-dmg \
     --filesystem "${DMG_FILESYSTEM}" \
     --format "${DMG_FORMAT}" \
+    --hdiutil-retries "${DMG_HDIUTIL_RETRIES}" \
     --volname "${DMG_VOLNAME}" \
     --volicon "${DMG_ICNS}" \
     --background "${DMG_BACKGROUND}" \

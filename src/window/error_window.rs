@@ -1,13 +1,13 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use skia_safe::{
+    Color4f, FontMgr, Paint, Point, Rect, Size,
     canvas::{Canvas, SaveLayerRec},
     colors::{BLACK, WHITE},
     textlayout::{
         FontCollection, Paragraph, ParagraphBuilder, ParagraphStyle, TextHeightBehavior, TextIndex,
         TextStyle,
     },
-    Color4f, FontMgr, Paint, Point, Rect, Size,
 };
 use strum::IntoEnumIterator;
 use strum::{EnumCount, EnumIter};
@@ -21,12 +21,14 @@ use winit::{
 };
 
 use crate::{
-    clipboard,
-    cmd_line::SRGB_DEFAULT,
-    renderer::{build_window_config, create_skia_renderer, SkiaRenderer, WindowConfig},
+    clipboard::{Clipboard, ClipboardHandle},
+    cmd_line::{CmdLineSettings, SRGB_DEFAULT},
+    renderer::{SkiaRenderer, WindowConfig, build_window_config, create_skia_renderer},
     settings::Settings,
-    window::{load_icon, UserEvent},
+    window::load_icon,
 };
+
+use super::EventPayload;
 
 const TEXT_COLOR: Color4f = WHITE;
 const BACKGROUND_COLOR: Color4f = BLACK;
@@ -36,8 +38,13 @@ const MAX_LINES: i32 = 9999;
 const MIN_SIZE: PhysicalSize<u32> = PhysicalSize::new(500, 500);
 const DEFAULT_SIZE: PhysicalSize<u32> = PhysicalSize::new(800, 600);
 
-pub fn show_error_window(message: &str, event_loop: EventLoop<UserEvent>, settings: Arc<Settings>) {
-    let mut error_window = ErrorWindow::new(message, settings);
+pub fn show_error_window(
+    message: &str,
+    event_loop: EventLoop<EventPayload>,
+    settings: Arc<Settings>,
+    clipboard: Arc<Mutex<Clipboard>>,
+) {
+    let mut error_window = ErrorWindow::new(message, settings, clipboard);
     event_loop.run_app(&mut error_window).ok();
 }
 
@@ -73,25 +80,23 @@ struct State {
     current_position: TextIndex,
     modifiers: Modifiers,
     mouse_scroll_accumulator: f32,
+    clipboard: ClipboardHandle,
 }
 
 struct ErrorWindow<'a> {
     state: Option<State>,
     message: &'a str,
     settings: Arc<Settings>,
+    clipboard: Option<Arc<Mutex<Clipboard>>>,
 }
 
 impl<'a> ErrorWindow<'a> {
-    fn new(message: &'a str, settings: Arc<Settings>) -> Self {
-        Self {
-            state: None,
-            message,
-            settings,
-        }
+    fn new(message: &'a str, settings: Arc<Settings>, clipboard: Arc<Mutex<Clipboard>>) -> Self {
+        Self { state: None, message, settings, clipboard: Some(clipboard) }
     }
 }
 
-impl ApplicationHandler<UserEvent> for ErrorWindow<'_> {
+impl ApplicationHandler<EventPayload> for ErrorWindow<'_> {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -104,13 +109,30 @@ impl ApplicationHandler<UserEvent> for ErrorWindow<'_> {
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_none() {
-            self.state = Some(State::new(self.message, event_loop, self.settings.clone()));
+            if let Some(clipboard) = self.clipboard.as_ref() {
+                self.state = Some(State::new(
+                    self.message,
+                    event_loop,
+                    self.settings.clone(),
+                    ClipboardHandle::new(clipboard),
+                ));
+            }
         }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Drop the clipboard while the event loop is still alive.
+        self.clipboard.take();
     }
 }
 
 impl State {
-    fn new(message: &str, event_loop: &ActiveEventLoop, settings: Arc<Settings>) -> Self {
+    fn new(
+        message: &str,
+        event_loop: &ActiveEventLoop,
+        settings: Arc<Settings>,
+        clipboard: ClipboardHandle,
+    ) -> Self {
         let message = message.trim_end();
 
         let font_manager = FontMgr::new();
@@ -120,10 +142,10 @@ impl State {
         let srgb = SRGB_DEFAULT == "1";
         let vsync = true;
         let window = create_window(event_loop, &settings);
-        let skia_renderer = create_skia_renderer(window, srgb, vsync, settings);
-        skia_renderer.window().set_visible(true);
-        let scale_factor = skia_renderer.window().scale_factor();
-        let size = skia_renderer.window().inner_size();
+        let skia_renderer = create_skia_renderer(&window, srgb, vsync, settings);
+        window.window.set_visible(true);
+        let scale_factor = window.window.scale_factor();
+        let size = window.window.inner_size();
         let paragraphs = create_paragraphs(message, scale_factor as f32, &font_collection);
         let scroll = Scroll::None;
         let current_position = 0;
@@ -140,6 +162,7 @@ impl State {
             current_position,
             modifiers,
             mouse_scroll_accumulator,
+            clipboard,
         }
     }
 
@@ -165,26 +188,16 @@ impl State {
                 self.paragraphs =
                     create_paragraphs(message, scale_factor as f32, &self.font_collection);
             }
-            WindowEvent::KeyboardInput {
-                event,
-                is_synthetic: false,
-                ..
-            } => {
+            WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => {
                 if self.handle_keyboard_input(event, event_loop, message) {
                     self.skia_renderer.window().request_redraw();
                 }
             }
-            WindowEvent::MouseWheel {
-                delta: MouseScrollDelta::LineDelta(_, y),
-                ..
-            } => {
+            WindowEvent::MouseWheel { delta: MouseScrollDelta::LineDelta(_, y), .. } => {
                 self.mouse_scroll_accumulator += y * 3.0;
                 self.handle_mouse_scroll();
             }
-            WindowEvent::MouseWheel {
-                delta: MouseScrollDelta::PixelDelta(delta),
-                ..
-            } => {
+            WindowEvent::MouseWheel { delta: MouseScrollDelta::PixelDelta(delta), .. } => {
                 if let Some(line_metrics) = self.paragraphs.message.get_line_metrics_at(0) {
                     let line_height = line_metrics.height;
                     self.mouse_scroll_accumulator += (delta.y / line_height) as f32;
@@ -257,7 +270,10 @@ impl State {
                         true
                     }
                     "y" => {
-                        let _ = clipboard::set_contents(message.to_string(), "+");
+                        if let Some(clipboard) = self.clipboard.upgrade() {
+                            let _ =
+                                clipboard.lock().unwrap().set_contents(message.to_string(), "+");
+                        }
                         true
                     }
                     _ => false,
@@ -385,10 +401,7 @@ impl State {
             (false, false) => PossibleScrollDirection::None,
         };
 
-        (
-            current_line_metrics.baseline - current_line_metrics.ascent,
-            possible_scroll_direction,
-        )
+        (current_line_metrics.baseline - current_line_metrics.ascent, possible_scroll_direction)
     }
 
     fn layout(&mut self) -> (Rect, Rect) {
@@ -400,14 +413,9 @@ impl State {
             p.layout(message_width);
         }
 
-        let help_message_height = self
-            .paragraphs
-            .help_messages
-            .iter()
-            .map(|p| p.height())
-            .reduce(f32::max)
-            .unwrap()
-            + PADDING;
+        let help_message_height =
+            self.paragraphs.help_messages.iter().map(|p| p.height()).reduce(f32::max).unwrap()
+                + PADDING;
 
         let message_rect = Rect::from_point_and_size(
             Point::new(PADDING, PADDING),
@@ -483,14 +491,12 @@ fn create_paragraphs(
         .try_into()
         .unwrap();
 
-    Paragraphs {
-        message: create_message(message, &normal_text),
-        help_messages,
-    }
+    Paragraphs { message: create_message(message, &normal_text), help_messages }
 }
 
 fn create_window(event_loop: &ActiveEventLoop, settings: &Settings) -> WindowConfig {
-    let icon = load_icon();
+    let cmd_line_settings = settings.get::<CmdLineSettings>();
+    let icon = load_icon(cmd_line_settings.icon.as_ref());
 
     let window_attributes = Window::default_attributes()
         .with_title("Neovide")

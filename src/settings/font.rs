@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use serde::Deserialize;
 
 use crate::renderer::fonts::font_options::{
-    points_to_pixels, FontDescription, FontEdging, FontFeature, FontHinting, FontOptions,
-    SecondaryFontDescription,
+    FontDescription, FontEdging, FontFeature, FontHinting, FontOptions, SecondaryFontDescription,
+    points_to_pixels,
 };
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -48,6 +48,7 @@ pub struct FontSettings {
     pub allow_float_size: Option<bool>,
     pub hinting: Option<String>,
     pub edging: Option<String>,
+    pub underline_offset: Option<f32>,
 }
 
 impl From<FontDescriptionSettings> for Vec<FontDescription> {
@@ -73,10 +74,7 @@ impl From<SecondaryFontDescriptionSettings> for Vec<SecondaryFontDescription> {
 impl From<SimpleFontDescription> for FontDescription {
     fn from(value: SimpleFontDescription) -> Self {
         match value {
-            SimpleFontDescription::String(value) => FontDescription {
-                family: value,
-                style: None,
-            },
+            SimpleFontDescription::String(value) => FontDescription { family: value, style: None },
             SimpleFontDescription::Details(value) => value,
         }
     }
@@ -85,10 +83,9 @@ impl From<SimpleFontDescription> for FontDescription {
 impl From<SimpleSecondaryFontDescription> for SecondaryFontDescription {
     fn from(value: SimpleSecondaryFontDescription) -> Self {
         match value {
-            SimpleSecondaryFontDescription::String(value) => SecondaryFontDescription {
-                family: Some(value),
-                style: None,
-            },
+            SimpleSecondaryFontDescription::String(value) => {
+                SecondaryFontDescription { family: Some(value), style: None }
+            }
             SimpleSecondaryFontDescription::Details(value) => value,
         }
     }
@@ -129,6 +126,7 @@ impl From<FontSettings> for FontOptions {
                 .edging
                 .map(|edging| FontEdging::parse(&edging).unwrap_or_default())
                 .unwrap_or_default(),
+            underline_offset: value.underline_offset.map(points_to_pixels),
         }
     }
 }
@@ -244,18 +242,9 @@ mod tests {
         assert_eq!(
             fonts,
             vec![
-                FontDescription {
-                    family: "NotFound".into(),
-                    style: Some("Bold".into())
-                },
-                FontDescription {
-                    family: "Consolas".into(),
-                    style: Some("Bold".into())
-                },
-                FontDescription {
-                    family: "Noto Emoji".into(),
-                    style: Some("Bold".into())
-                }
+                FontDescription { family: "NotFound".into(), style: Some("Bold".into()) },
+                FontDescription { family: "Consolas".into(), style: Some("Bold".into()) },
+                FontDescription { family: "Noto Emoji".into(), style: Some("Bold".into()) }
             ]
         );
     }
@@ -281,22 +270,10 @@ mod tests {
         assert_eq!(
             fonts,
             vec![
-                FontDescription {
-                    family: "NotFound".into(),
-                    style: Some("Bold".into())
-                },
-                FontDescription {
-                    family: "Menlo".into(),
-                    style: Some("Bold".into())
-                },
-                FontDescription {
-                    family: "Consolas".into(),
-                    style: Some("Bold".into())
-                },
-                FontDescription {
-                    family: "Noto Emoji".into(),
-                    style: Some("Bold".into())
-                }
+                FontDescription { family: "NotFound".into(), style: Some("Bold".into()) },
+                FontDescription { family: "Menlo".into(), style: Some("Bold".into()) },
+                FontDescription { family: "Consolas".into(), style: Some("Bold".into()) },
+                FontDescription { family: "Noto Emoji".into(), style: Some("Bold".into()) }
             ]
         );
     }

@@ -1,18 +1,25 @@
-use std::{iter, mem};
+use std::{iter, process::ExitStatus};
 
-use crate::{dimensions::Dimensions, frame::Frame, settings::*, utils::handle_wslpaths};
-
-use anyhow::Result;
-use clap::{
-    builder::{styling, FalseyValueParser, Styles},
-    ArgAction, Parser,
+use crate::{
+    bridge::create_blocking_nvim_command, dimensions::Dimensions, frame::Frame, settings::*,
+    version::BUILD_VERSION,
 };
+
+use anyhow::{Context, Result};
+use clap::{
+    ArgAction, Parser, ValueEnum,
+    builder::{FalseyValueParser, Styles, styling},
+};
+#[cfg(target_os = "macos")]
+use clap::{CommandFactory, parser::ValueSource};
 use winit::window::CursorIcon;
 
 #[cfg(target_os = "windows")]
 pub const SRGB_DEFAULT: &str = "1";
 #[cfg(not(target_os = "windows"))]
 pub const SRGB_DEFAULT: &str = "0";
+
+const NEOVIM_PASSTHROUGH_FLAGS: &[&str] = &["-h", "--help", "-?", "-v", "--version", "--api-info"];
 
 fn get_styles() -> Styles {
     styling::Styles::styled()
@@ -23,7 +30,7 @@ fn get_styles() -> Styles {
 }
 
 #[derive(Clone, Debug, Parser)]
-#[command(version, about, long_about = None, styles = get_styles())]
+#[command(version = BUILD_VERSION, about, long_about = None, styles = get_styles())]
 pub struct CmdLineSettings {
     /// Files to open (usually plainly appended to NeoVim args, except when --wsl is used)
     #[arg(
@@ -46,8 +53,18 @@ pub struct CmdLineSettings {
     pub log_to_file: bool,
 
     /// Connect to the named pipe or socket at ADDRESS
-    #[arg(long, alias = "remote-tcp", value_name = "ADDRESS")]
+    #[arg(long, alias = "remote-tcp", env = "NEOVIDE_SERVER", value_name = "ADDRESS")]
     pub server: Option<String>,
+
+    /// Open files in an existing Neovide app instance if one is already running
+    #[cfg(target_os = "macos")]
+    #[arg(long = "reuse-instance", action = ArgAction::SetTrue, default_value = "0", value_parser = FalseyValueParser::new())]
+    pub reuse_instance: bool,
+
+    /// Open files in a new window when reusing an existing Neovide instance
+    #[cfg(target_os = "macos")]
+    #[arg(long = "new-window", requires = "reuse_instance", action = ArgAction::SetTrue, default_value = "0", value_parser = FalseyValueParser::new())]
+    pub new_window: bool,
 
     /// Run NeoVim in WSL rather than on the host
     #[arg(long, env = "NEOVIDE_WSL")]
@@ -63,11 +80,7 @@ pub struct CmdLineSettings {
     pub no_multi_grid: bool,
 
     /// Which mouse cursor icon to use
-    #[arg(
-        long = "mouse-cursor-icon",
-        env = "NEOVIDE_MOUSE_CURSOR_ICON",
-        default_value = "arrow"
-    )]
+    #[arg(long = "mouse-cursor-icon", env = "NEOVIDE_MOUSE_CURSOR_ICON", default_value = "arrow")]
     pub mouse_cursor_icon: MouseCursorIcon,
 
     /// Sets title hidden for the window
@@ -95,6 +108,34 @@ pub struct CmdLineSettings {
     #[arg(long = "no-tabs", action = ArgAction::SetTrue, value_parser = FalseyValueParser::new())]
     _no_tabs: bool,
 
+    /// Keep the native system tab bar visible when windows merge together
+    #[cfg(target_os = "macos")]
+    #[arg(long = "system-native-tabs", env = "NEOVIDE_SYSTEM_NATIVE_TABS", action = ArgAction::SetTrue, default_value = "0", value_parser = FalseyValueParser::new())]
+    pub system_native_tabs: bool,
+
+    /// Hide the native system tab bar even if the config enables it
+    #[cfg(target_os = "macos")]
+    #[arg(long = "no-system-native-tabs", action = ArgAction::SetTrue, value_parser = FalseyValueParser::new())]
+    _no_system_native_tabs: bool,
+
+    /// Cycle to the previous system tab when pressed inside Neovide
+    #[cfg(target_os = "macos")]
+    #[arg(
+        long = "system-tab-prev-hotkey",
+        env = "NEOVIDE_SYSTEM_TAB_PREV_HOTKEY",
+        default_value = "cmd+shift+["
+    )]
+    pub system_tab_prev_hotkey: String,
+
+    /// Cycle to the next system tab when pressed inside Neovide
+    #[cfg(target_os = "macos")]
+    #[arg(
+        long = "system-tab-next-hotkey",
+        env = "NEOVIDE_SYSTEM_TAB_NEXT_HOTKEY",
+        default_value = "cmd+shift+]"
+    )]
+    pub system_tab_next_hotkey: String,
+
     /// Request sRGB when initializing the window, may help with GPUs with weird pixel
     /// formats. Default on Windows.
     #[arg(long = "srgb", env = "NEOVIDE_SRGB", action = ArgAction::SetTrue, default_value = SRGB_DEFAULT, value_parser = FalseyValueParser::new())]
@@ -118,19 +159,11 @@ pub struct CmdLineSettings {
     pub neovim_bin: Option<String>,
 
     /// The app ID to show to the compositor (Wayland only, useful for setting WM rules)
-    #[arg(
-        long = "wayland_app_id",
-        env = "NEOVIDE_APP_ID",
-        default_value = "neovide"
-    )]
+    #[arg(long = "wayland_app_id", env = "NEOVIDE_APP_ID", default_value = "neovide")]
     pub wayland_app_id: String,
 
     /// The class part of the X11 WM_CLASS property (X only, useful for setting WM rules)
-    #[arg(
-        long = "x11-wm-class",
-        env = "NEOVIDE_WM_CLASS",
-        default_value = "neovide"
-    )]
+    #[arg(long = "x11-wm-class", env = "NEOVIDE_WM_CLASS", default_value = "neovide")]
     pub x11_wm_class: String,
 
     /// The instance part of the X11 WM_CLASS property (X only, useful for setting WM rules)
@@ -141,6 +174,10 @@ pub struct CmdLineSettings {
     )]
     pub x11_wm_class_instance: String,
 
+    /// The custom icon to use for the app.
+    #[arg(long, env = "NEOVIDE_ICON")]
+    pub icon: Option<String>,
+
     #[command(flatten)]
     pub geometry: GeometryArgs,
 
@@ -148,6 +185,10 @@ pub struct CmdLineSettings {
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     #[arg(long = "opengl", env = "NEOVIDE_OPENGL", action = ArgAction::SetTrue, value_parser = FalseyValueParser::new())]
     pub opengl: bool,
+
+    /// Change to this directory during startup.
+    #[arg(long = "chdir", env = "NEOVIDE_CHDIR")]
+    pub chdir: Option<String>,
 }
 
 // geometry, size and maximized are mutually exclusive
@@ -156,11 +197,11 @@ pub struct CmdLineSettings {
 pub struct GeometryArgs {
     /// The initial grid size of the window [<columns>x<lines>]. Defaults to columns/lines from init.vim/lua if no value is given.
     /// If --grid is not set then it's inferred from the window size
-    #[arg(long)]
+    #[arg(long, env = "NEOVIDE_GRID")]
     pub grid: Option<Option<Dimensions>>,
 
     /// The size of the window in pixels.
-    #[arg(long)]
+    #[arg(long, env = "NEOVIDE_SIZE")]
     pub size: Option<Dimensions>,
 
     /// Maximize the window on startup (not equivalent to fullscreen)
@@ -168,18 +209,44 @@ pub struct GeometryArgs {
     pub maximized: bool,
 }
 
-#[derive(ValueEnum, Clone, Debug)]
+#[derive(ValueEnum, Clone, Debug, PartialEq, Eq)]
 pub enum MouseCursorIcon {
     Arrow,
     IBeam,
 }
 
 impl MouseCursorIcon {
+    pub fn from_config(value: Option<&str>) -> Result<Self, String> {
+        value.map_or(Ok(Self::Arrow), |value| <Self as ValueEnum>::from_str(value, false))
+    }
+
     pub fn parse(&self) -> CursorIcon {
         match self {
             MouseCursorIcon::Arrow => CursorIcon::Default,
             MouseCursorIcon::IBeam => CursorIcon::Text,
         }
+    }
+}
+
+impl GeometryArgs {
+    pub fn from_config(
+        size: Option<&str>,
+        grid: Option<&str>,
+        maximized: Option<bool>,
+    ) -> Result<Self, String> {
+        let maximized = maximized.unwrap_or(false);
+        let has_size = size.is_some();
+        let has_grid = grid.is_some();
+        let conflicting = (has_size && has_grid) || (maximized && (has_size || has_grid));
+        if conflicting {
+            return Err("size, grid and maximized are mutually exclusive".to_owned());
+        }
+
+        Ok(Self {
+            grid: grid.map(|grid| grid.parse::<Dimensions>().map(Some)).transpose()?,
+            size: size.map(str::parse::<Dimensions>).transpose()?,
+            maximized,
+        })
     }
 }
 
@@ -196,6 +263,11 @@ pub fn handle_command_line_arguments(args: Vec<String>, settings: &Settings) -> 
         cmdline.tabs = false;
     }
 
+    #[cfg(target_os = "macos")]
+    if cmdline._no_system_native_tabs {
+        cmdline.system_native_tabs = false;
+    }
+
     if cmdline._no_fork {
         cmdline.fork = false;
     }
@@ -208,19 +280,55 @@ pub fn handle_command_line_arguments(args: Vec<String>, settings: &Settings) -> 
         cmdline.vsync = false;
     }
 
-    cmdline.neovim_args = cmdline
-        .tabs
-        .then(|| "-p".to_string())
-        .into_iter()
-        .chain(handle_wslpaths(
-            mem::take(&mut cmdline.files_to_open),
-            cmdline.wsl,
-        ))
-        .chain(cmdline.neovim_args)
-        .collect();
-
     settings.set::<CmdLineSettings>(&cmdline);
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub fn argv_chdir() -> Option<String> {
+    let matches = CmdLineSettings::command().try_get_matches_from(std::env::args_os()).ok()?;
+
+    (matches.value_source("chdir") == Some(ValueSource::CommandLine))
+        .then(|| matches.get_one::<String>("chdir").cloned())
+        .flatten()
+}
+
+pub fn maybe_passthrough_to_neovim(
+    cmdline_settings: &CmdLineSettings,
+) -> Result<Option<ExitStatus>> {
+    if !neovim_passthrough_requested(&cmdline_settings.neovim_args) {
+        return Ok(None);
+    }
+
+    let mut command = create_blocking_nvim_command(cmdline_settings, false);
+    let binary = cmdline_settings.neovim_bin.clone().unwrap_or_else(|| "nvim".to_owned());
+    let status = command
+        .status()
+        .with_context(|| format!("Failed to run {binary} for passthrough output"))?;
+
+    Ok(Some(status))
+}
+
+pub fn exit_status_code(status: ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+    }
+
+    #[cfg(windows)]
+    {
+        status.code().unwrap_or(1)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        return status.code().unwrap_or(1);
+    }
+}
+
+fn neovim_passthrough_requested(args: &[String]) -> bool {
+    args.iter().any(|arg| NEOVIM_PASSTHROUGH_FLAGS.contains(&arg.as_str()))
 }
 
 #[cfg(test)]
@@ -234,16 +342,11 @@ mod tests {
     #[test]
     fn test_neovim_passthrough() {
         let settings = Settings::new();
-        let args: Vec<String> = ["neovide", "--no-tabs", "--", "--clean"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let args: Vec<String> =
+            ["neovide", "--no-tabs", "--", "--clean"].iter().map(|s| s.to_string()).collect();
 
         handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
-        assert_eq!(
-            settings.get::<CmdLineSettings>().neovim_args,
-            vec!["--clean"]
-        );
+        assert_eq!(settings.get::<CmdLineSettings>().neovim_args, vec!["--clean"]);
     }
 
     #[test]
@@ -255,10 +358,8 @@ mod tests {
             .collect();
 
         handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
-        assert_eq!(
-            settings.get::<CmdLineSettings>().neovim_args,
-            vec!["./foo.txt", "./bar.md"]
-        );
+        assert_eq!(settings.get::<CmdLineSettings>().files_to_open, vec!["./foo.txt", "./bar.md"]);
+        assert!(settings.get::<CmdLineSettings>().neovim_args.is_empty());
     }
 
     #[test]
@@ -279,94 +380,176 @@ mod tests {
 
         handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
         assert_eq!(
-            settings.get::<CmdLineSettings>().neovim_args,
+            settings.get::<CmdLineSettings>().files_to_open,
             vec![
-                "/mnt/c/Users/MyUser/foo.txt",
-                "/mnt/c/bar.md",
-                "/mnt/c/Program Files (x86)/Some Application/Settings.ini"
+                "C:\\Users\\MyUser\\foo.txt",
+                "C:\\bar.md",
+                "C:\\Program Files (x86)\\Some Application\\Settings.ini"
             ]
         );
+        assert!(settings.get::<CmdLineSettings>().neovim_args.is_empty());
     }
 
     #[test]
     fn test_files_to_open_with_passthrough() {
         let settings = Settings::new();
-        let args: Vec<String> = [
-            "neovide",
-            "--no-tabs",
-            "./foo.txt",
-            "./bar.md",
-            "--",
-            "--clean",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+        let args: Vec<String> = ["neovide", "--no-tabs", "./foo.txt", "./bar.md", "--", "--clean"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
 
         handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
-        assert_eq!(
-            settings.get::<CmdLineSettings>().neovim_args,
-            vec!["./foo.txt", "./bar.md", "--clean"]
-        );
+        assert_eq!(settings.get::<CmdLineSettings>().neovim_args, vec!["--clean"]);
+        assert_eq!(settings.get::<CmdLineSettings>().files_to_open, vec!["./foo.txt", "./bar.md"]);
     }
 
     #[test]
     fn test_files_to_open_with_flag() {
         let settings = Settings::new();
-        let args: Vec<String> = ["neovide", "./foo.txt", "./bar.md", "--grid=42x24"]
+        let args: Vec<String> = ["neovide", "./foo.txt", "./bar.md", "--grid=420x240"]
             .iter()
             .map(|s| s.to_string())
             .collect();
 
         handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
-        assert_eq!(
-            settings.get::<CmdLineSettings>().neovim_args,
-            vec!["-p", "./foo.txt", "./bar.md"]
-        );
+        assert!(settings.get::<CmdLineSettings>().neovim_args.is_empty());
+        assert_eq!(settings.get::<CmdLineSettings>().files_to_open, vec!["./foo.txt", "./bar.md"]);
 
         assert_eq!(
             settings.get::<CmdLineSettings>().geometry.grid,
-            Some(Some(Dimensions {
-                width: 42,
-                height: 24
-            })),
+            Some(Some(Dimensions { width: 420, height: 240 })),
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_reuse_instance_flag() {
+        let settings = Settings::new();
+        let args: Vec<String> =
+            ["neovide", "--reuse-instance", "./foo.txt"].iter().map(|s| s.to_string()).collect();
+
+        handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
+        assert!(settings.get::<CmdLineSettings>().reuse_instance);
+        assert_eq!(settings.get::<CmdLineSettings>().files_to_open, vec!["./foo.txt"]);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_new_window_flag() {
+        let settings = Settings::new();
+        let args: Vec<String> = ["neovide", "--reuse-instance", "--new-window", "./foo.txt"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
+        assert!(settings.get::<CmdLineSettings>().reuse_instance);
+        assert!(settings.get::<CmdLineSettings>().new_window);
+        assert_eq!(settings.get::<CmdLineSettings>().files_to_open, vec!["./foo.txt"]);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_new_window_requires_reuse_instance() {
+        let settings = Settings::new();
+        let args: Vec<String> =
+            ["neovide", "--new-window", "./foo.txt"].iter().map(|s| s.to_string()).collect();
+
+        assert!(handle_command_line_arguments(args, &settings).is_err());
     }
 
     #[test]
     fn test_grid() {
         let settings = Settings::new();
-        let args: Vec<String> = ["neovide", "--grid=42x24"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let args: Vec<String> =
+            ["neovide", "--grid=420x240"].iter().map(|s| s.to_string()).collect();
 
         handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
         assert_eq!(
             settings.get::<CmdLineSettings>().geometry.grid,
-            Some(Some(Dimensions {
-                width: 42,
-                height: 24
-            })),
+            Some(Some(Dimensions { width: 420, height: 240 })),
+        );
+    }
+
+    #[test]
+    fn test_grid_environment_variable() {
+        let settings = Settings::new();
+        let args: Vec<String> = ["neovide"].iter().map(|s| s.to_string()).collect();
+
+        let _env = ScopedEnv::set("NEOVIDE_GRID", "420x240");
+        handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
+        assert_eq!(
+            settings.get::<CmdLineSettings>().geometry.grid,
+            Some(Some(Dimensions { width: 420, height: 240 })),
         );
     }
 
     #[test]
     fn test_size() {
         let settings = Settings::new();
-        let args: Vec<String> = ["neovide", "--size=420x240"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let args: Vec<String> =
+            ["neovide", "--size=420x240"].iter().map(|s| s.to_string()).collect();
 
         handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
         assert_eq!(
             settings.get::<CmdLineSettings>().geometry.size,
-            Some(Dimensions {
-                width: 420,
-                height: 240,
-            }),
+            Some(Dimensions { width: 420, height: 240 }),
         );
+    }
+
+    #[test]
+    fn test_size_environment_variable() {
+        let settings = Settings::new();
+        let args: Vec<String> = ["neovide"].iter().map(|s| s.to_string()).collect();
+
+        let _env = ScopedEnv::set("NEOVIDE_SIZE", "420x240");
+        handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
+        assert_eq!(
+            settings.get::<CmdLineSettings>().geometry.size,
+            Some(Dimensions { width: 420, height: 240 }),
+        );
+    }
+
+    #[test]
+    fn test_geometry_args_from_config_size() {
+        assert_eq!(
+            GeometryArgs::from_config(Some("420x240"), None, None).unwrap(),
+            GeometryArgs {
+                size: Some(Dimensions { width: 420, height: 240 }),
+                grid: None,
+                maximized: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_geometry_args_from_config_grid() {
+        assert_eq!(
+            GeometryArgs::from_config(None, Some("80x24"), None).unwrap(),
+            GeometryArgs {
+                size: None,
+                grid: Some(Some(Dimensions { width: 80, height: 24 })),
+                maximized: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_geometry_args_from_config_rejects_conflicts() {
+        assert_eq!(
+            GeometryArgs::from_config(Some("420x240"), Some("80x24"), None).unwrap_err(),
+            "size, grid and maximized are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn test_server_environment_variable() {
+        let settings = Settings::new();
+        let args: Vec<String> = ["neovide"].iter().map(|s| s.to_string()).collect();
+
+        let _env = ScopedEnv::set("NEOVIDE_SERVER", "127.0.0.1:7777");
+        handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
+        assert_eq!(settings.get::<CmdLineSettings>().server, Some("127.0.0.1:7777".to_string()));
     }
 
     #[test]
@@ -379,12 +562,19 @@ mod tests {
     }
 
     #[test]
+    fn test_passthrough_detection_help() {
+        assert!(super::neovim_passthrough_requested(&["-h".into()]));
+    }
+
+    #[test]
+    fn test_passthrough_detection_none() {
+        assert!(!super::neovim_passthrough_requested(&["file".into(), "--clean".into()]));
+    }
+
+    #[test]
     fn test_frameless_flag() {
         let settings = Settings::new();
-        let args: Vec<String> = ["neovide", "--frame=full"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let args: Vec<String> = ["neovide", "--frame=full"].iter().map(|s| s.to_string()).collect();
 
         handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
         assert_eq!(settings.get::<CmdLineSettings>().frame, Frame::Full);
@@ -403,16 +593,11 @@ mod tests {
     #[test]
     fn test_neovim_bin_arg() {
         let settings = Settings::new();
-        let args: Vec<String> = ["neovide", "--neovim-bin", "foo"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let args: Vec<String> =
+            ["neovide", "--neovim-bin", "foo"].iter().map(|s| s.to_string()).collect();
 
         handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
-        assert_eq!(
-            settings.get::<CmdLineSettings>().neovim_bin,
-            Some("foo".to_owned())
-        );
+        assert_eq!(settings.get::<CmdLineSettings>().neovim_bin, Some("foo".to_owned()));
     }
 
     #[test]
@@ -422,10 +607,7 @@ mod tests {
 
         let _env = ScopedEnv::set("NEOVIM_BIN", "foo");
         handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
-        assert_eq!(
-            settings.get::<CmdLineSettings>().neovim_bin,
-            Some("foo".to_owned())
-        );
+        assert_eq!(settings.get::<CmdLineSettings>().neovim_bin, Some("foo".to_owned()));
     }
 
     #[test]
@@ -444,10 +626,7 @@ mod tests {
     #[test]
     fn test_srgb() {
         let settings = Settings::new();
-        let args: Vec<String> = ["neovide", "--srgb"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let args: Vec<String> = ["neovide", "--srgb"].iter().map(|s| s.to_string()).collect();
 
         handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
         assert_eq!(settings.get::<CmdLineSettings>().srgb, true);
@@ -456,10 +635,7 @@ mod tests {
     #[test]
     fn test_nosrgb() {
         let settings = Settings::new();
-        let args: Vec<String> = ["neovide", "--no-srgb"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let args: Vec<String> = ["neovide", "--no-srgb"].iter().map(|s| s.to_string()).collect();
 
         handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
         assert_eq!(settings.get::<CmdLineSettings>().srgb, false);
@@ -478,10 +654,7 @@ mod tests {
     #[test]
     fn test_override_srgb_environment() {
         let settings = Settings::new();
-        let args: Vec<String> = ["neovide", "--no-srgb"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let args: Vec<String> = ["neovide", "--no-srgb"].iter().map(|s| s.to_string()).collect();
 
         let _env = ScopedEnv::set("NEOVIDE_SRGB", "1");
         handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
@@ -491,10 +664,7 @@ mod tests {
     #[test]
     fn test_override_nosrgb_environment() {
         let settings = Settings::new();
-        let args: Vec<String> = ["neovide", "--srgb"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let args: Vec<String> = ["neovide", "--srgb"].iter().map(|s| s.to_string()).collect();
 
         let _env = ScopedEnv::set("NEOVIDE_SRGB", "0");
         handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
@@ -513,10 +683,7 @@ mod tests {
     #[test]
     fn test_vsync() {
         let settings = Settings::new();
-        let args: Vec<String> = ["neovide", "--vsync"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let args: Vec<String> = ["neovide", "--vsync"].iter().map(|s| s.to_string()).collect();
 
         handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
         assert_eq!(settings.get::<CmdLineSettings>().vsync, true);
@@ -525,10 +692,7 @@ mod tests {
     #[test]
     fn test_novsync() {
         let settings = Settings::new();
-        let args: Vec<String> = ["neovide", "--no-vsync"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let args: Vec<String> = ["neovide", "--no-vsync"].iter().map(|s| s.to_string()).collect();
 
         handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
         assert_eq!(settings.get::<CmdLineSettings>().vsync, false);
@@ -547,10 +711,7 @@ mod tests {
     #[test]
     fn test_override_vsync_environment() {
         let settings = Settings::new();
-        let args: Vec<String> = ["neovide", "--no-vsync"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let args: Vec<String> = ["neovide", "--no-vsync"].iter().map(|s| s.to_string()).collect();
 
         let _env = ScopedEnv::set("NEOVIDE_VSYNC", "1");
         handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
@@ -560,13 +721,43 @@ mod tests {
     #[test]
     fn test_override_novsync_environment() {
         let settings = Settings::new();
-        let args: Vec<String> = ["neovide", "--vsync"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let args: Vec<String> = ["neovide", "--vsync"].iter().map(|s| s.to_string()).collect();
 
         let _env = ScopedEnv::set("NEOVIDE_VSYNC", "0");
         handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
         assert_eq!(settings.get::<CmdLineSettings>().vsync, true,);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_system_native_tabs_flag() {
+        let settings = Settings::new();
+        let args: Vec<String> =
+            ["neovide", "--system-native-tabs"].iter().map(|s| s.to_string()).collect();
+
+        handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
+        assert!(settings.get::<CmdLineSettings>().system_native_tabs);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_system_native_tabs_env() {
+        let settings = Settings::new();
+        let args: Vec<String> = ["neovide"].iter().map(|s| s.to_string()).collect();
+
+        let _env = ScopedEnv::set("NEOVIDE_SYSTEM_NATIVE_TABS", "1");
+        handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
+        assert!(settings.get::<CmdLineSettings>().system_native_tabs);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_system_native_tabs_override_env() {
+        let settings = Settings::new();
+        let args: Vec<String> =
+            ["neovide", "--no-system-native-tabs"].iter().map(|s| s.to_string()).collect();
+
+        let _env = ScopedEnv::set("NEOVIDE_SYSTEM_NATIVE_TABS", "1");
+        handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
+        assert!(!settings.get::<CmdLineSettings>().system_native_tabs);
     }
 }
