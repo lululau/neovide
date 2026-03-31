@@ -50,7 +50,6 @@ system-pinned-hotkey = "cmd+ctrl+z" # macOS only
 system-switcher-hotkey = "cmd+ctrl+n" # macOS only, requires system-native-tabs = true
 system-tab-prev-hotkey = "cmd+shift+[" # macOS only
 system-tab-next-hotkey = "cmd+shift+]" # macOS only
-theme = "auto"
 title-hidden = false
 vsync = true
 # wayland-app-id = "neovide"
@@ -79,7 +78,7 @@ Settings that are mutually exclusive on the command line (for example `size`, `g
 
 #### Window Geometry
 
-**Nightly.**
+**Available since 0.16.0.**
 
 `size`, `grid` and `maximized` can be hot reloaded from `config.toml`.
 
@@ -88,7 +87,7 @@ applies a new Neovim grid size, and `maximized` updates the live maximized state
 
 #### Idle
 
-**Nightly.**
+**Available since 0.16.0.**
 
 `idle` can be hot reloaded from `config.toml`.
 
