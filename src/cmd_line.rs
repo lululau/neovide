@@ -1,18 +1,25 @@
-use std::{iter, process::ExitStatus};
+use std::iter;
+use std::process::ExitStatus;
 
-use crate::{
-    bridge::create_blocking_nvim_command, dimensions::Dimensions, frame::Frame, settings::*,
-    version::BUILD_VERSION,
-};
-
-use anyhow::{Context, Result};
-use clap::{
-    ArgAction, Parser, ValueEnum,
-    builder::{FalseyValueParser, Styles, styling},
-};
+use anyhow::Context;
+use anyhow::Result;
+use clap::ArgAction;
 #[cfg(target_os = "macos")]
-use clap::{CommandFactory, parser::ValueSource};
+use clap::CommandFactory;
+use clap::Parser;
+use clap::ValueEnum;
+use clap::builder::FalseyValueParser;
+use clap::builder::Styles;
+use clap::builder::styling;
+#[cfg(target_os = "macos")]
+use clap::parser::ValueSource;
 use winit::window::CursorIcon;
+
+use crate::bridge::create_blocking_nvim_command;
+use crate::dimensions::Dimensions;
+use crate::frame::Frame;
+use crate::settings::*;
+use crate::version::BUILD_VERSION;
 
 #[cfg(target_os = "windows")]
 pub const SRGB_DEFAULT: &str = "1";
@@ -118,6 +125,69 @@ pub struct CmdLineSettings {
     #[arg(long = "no-system-native-tabs", action = ArgAction::SetTrue, value_parser = FalseyValueParser::new())]
     _no_system_native_tabs: bool,
 
+    /// Set the Window > New Window shortcut
+    #[cfg(target_os = "macos")]
+    #[arg(
+        long = "system-new-window-hotkey",
+        env = "NEOVIDE_SYSTEM_NEW_WINDOW_HOTKEY",
+        default_value = "cmd+n"
+    )]
+    pub system_new_window_hotkey: String,
+
+    /// Set the Neovide > Hide shortcut
+    #[cfg(target_os = "macos")]
+    #[arg(
+        long = "system-hide-hotkey",
+        env = "NEOVIDE_SYSTEM_HIDE_HOTKEY",
+        default_value = "cmd+h"
+    )]
+    pub system_hide_hotkey: String,
+
+    /// Set the Neovide > Hide Others shortcut
+    #[cfg(target_os = "macos")]
+    #[arg(
+        long = "system-hide-others-hotkey",
+        env = "NEOVIDE_SYSTEM_HIDE_OTHERS_HOTKEY",
+        default_value = "cmd+alt+h"
+    )]
+    pub system_hide_others_hotkey: String,
+
+    /// Set the Neovide > Quit shortcut
+    #[cfg(target_os = "macos")]
+    #[arg(
+        long = "system-quit-hotkey",
+        env = "NEOVIDE_SYSTEM_QUIT_HOTKEY",
+        default_value = "cmd+q"
+    )]
+    pub system_quit_hotkey: String,
+
+    /// Set the Window > Minimize shortcut
+    #[cfg(target_os = "macos")]
+    #[arg(
+        long = "system-minimize-hotkey",
+        env = "NEOVIDE_SYSTEM_MINIMIZE_HOTKEY",
+        default_value = "cmd+m"
+    )]
+    pub system_minimize_hotkey: String,
+
+    /// Set the Window > Enter Full Screen shortcut
+    #[cfg(target_os = "macos")]
+    #[arg(
+        long = "system-fullscreen-hotkey",
+        env = "NEOVIDE_SYSTEM_FULLSCREEN_HOTKEY",
+        default_value = "cmd+ctrl+f"
+    )]
+    pub system_fullscreen_hotkey: String,
+
+    /// Set the Window > Editors shortcut
+    #[cfg(target_os = "macos")]
+    #[arg(
+        long = "system-show-all-tabs-hotkey",
+        env = "NEOVIDE_SYSTEM_SHOW_ALL_TABS_HOTKEY",
+        default_value = "cmd+shift+e"
+    )]
+    pub system_show_all_tabs_hotkey: String,
+
     /// Cycle to the previous system tab when pressed inside Neovide
     #[cfg(target_os = "macos")]
     #[arg(
@@ -154,12 +224,25 @@ pub struct CmdLineSettings {
     #[arg(long = "no-vsync", action = ArgAction::SetTrue, value_parser = FalseyValueParser::new())]
     _no_vsync: bool,
 
+    /// Temporarily capture startup messages before the first grid render [DEFAULT]
+    #[arg(long = "startup-message-capture", env = "NEOVIDE_STARTUP_MESSAGE_CAPTURE", action = ArgAction::SetTrue, default_value = "1", value_parser = FalseyValueParser::new())]
+    pub startup_message_capture: bool,
+
+    /// Do not temporarily capture startup messages before the first grid render
+    #[arg(long = "no-startup-message-capture", action = ArgAction::SetTrue, value_parser = FalseyValueParser::new())]
+    _no_startup_message_capture: bool,
+
     /// Which NeoVim binary to invoke headlessly instead of `nvim` found on $PATH
     #[arg(long = "neovim-bin", env = "NEOVIM_BIN")]
     pub neovim_bin: Option<String>,
 
     /// The app ID to show to the compositor (Wayland only, useful for setting WM rules)
-    #[arg(long = "wayland_app_id", env = "NEOVIDE_APP_ID", default_value = "neovide")]
+    #[arg(
+        long = "wayland-app-id",
+        alias = "wayland_app_id",
+        env = "NEOVIDE_APP_ID",
+        default_value = "neovide"
+    )]
     pub wayland_app_id: String,
 
     /// The class part of the X11 WM_CLASS property (X only, useful for setting WM rules)
@@ -251,9 +334,7 @@ impl GeometryArgs {
 }
 
 impl Default for CmdLineSettings {
-    fn default() -> Self {
-        Self::parse_from(iter::empty::<String>())
-    }
+    fn default() -> Self { Self::parse_from(iter::empty::<String>()) }
 }
 
 pub fn handle_command_line_arguments(args: Vec<String>, settings: &Settings) -> Result<()> {
@@ -278,6 +359,10 @@ pub fn handle_command_line_arguments(args: Vec<String>, settings: &Settings) -> 
 
     if cmdline._no_vsync {
         cmdline.vsync = false;
+    }
+
+    if cmdline._no_startup_message_capture {
+        cmdline.startup_message_capture = false;
     }
 
     settings.set::<CmdLineSettings>(&cmdline);
@@ -456,6 +541,86 @@ mod tests {
             ["neovide", "--new-window", "./foo.txt"].iter().map(|s| s.to_string()).collect();
 
         assert!(handle_command_line_arguments(args, &settings).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_system_new_window_hotkey_flag() {
+        let settings = Settings::new();
+        let args: Vec<String> = ["neovide", "--system-new-window-hotkey", "cmd+shift+n"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
+        assert_eq!(settings.get::<CmdLineSettings>().system_new_window_hotkey, "cmd+shift+n");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_system_new_window_hotkey_environment_variable() {
+        let settings = Settings::new();
+        let args: Vec<String> = ["neovide"].iter().map(|s| s.to_string()).collect();
+
+        let _env = ScopedEnv::set("NEOVIDE_SYSTEM_NEW_WINDOW_HOTKEY", "ctrl+shift+n");
+        handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
+        assert_eq!(settings.get::<CmdLineSettings>().system_new_window_hotkey, "ctrl+shift+n");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_system_menu_hotkey_flags() {
+        let settings = Settings::new();
+        let args: Vec<String> = [
+            "neovide",
+            "--system-hide-hotkey",
+            "ctrl+h",
+            "--system-hide-others-hotkey",
+            "ctrl+alt+h",
+            "--system-quit-hotkey",
+            "cmd+shift+q",
+            "--system-minimize-hotkey",
+            "cmd+shift+m",
+            "--system-fullscreen-hotkey",
+            "ctrl+alt+f",
+            "--system-show-all-tabs-hotkey",
+            "cmd+e",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
+        let cmdline = settings.get::<CmdLineSettings>();
+        assert_eq!(cmdline.system_hide_hotkey, "ctrl+h");
+        assert_eq!(cmdline.system_hide_others_hotkey, "ctrl+alt+h");
+        assert_eq!(cmdline.system_quit_hotkey, "cmd+shift+q");
+        assert_eq!(cmdline.system_minimize_hotkey, "cmd+shift+m");
+        assert_eq!(cmdline.system_fullscreen_hotkey, "ctrl+alt+f");
+        assert_eq!(cmdline.system_show_all_tabs_hotkey, "cmd+e");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_system_menu_hotkey_environment_variables() {
+        let settings = Settings::new();
+        let args: Vec<String> = ["neovide"].iter().map(|s| s.to_string()).collect();
+
+        let _hide = ScopedEnv::set("NEOVIDE_SYSTEM_HIDE_HOTKEY", "ctrl+h");
+        let _hide_others = ScopedEnv::set("NEOVIDE_SYSTEM_HIDE_OTHERS_HOTKEY", "ctrl+alt+h");
+        let _quit = ScopedEnv::set("NEOVIDE_SYSTEM_QUIT_HOTKEY", "ctrl+q");
+        let _minimize = ScopedEnv::set("NEOVIDE_SYSTEM_MINIMIZE_HOTKEY", "ctrl+m");
+        let _fullscreen = ScopedEnv::set("NEOVIDE_SYSTEM_FULLSCREEN_HOTKEY", "ctrl+shift+f");
+        let _show_all_tabs = ScopedEnv::set("NEOVIDE_SYSTEM_SHOW_ALL_TABS_HOTKEY", "ctrl+shift+e");
+
+        handle_command_line_arguments(args, &settings).expect("Could not parse arguments");
+        let cmdline = settings.get::<CmdLineSettings>();
+        assert_eq!(cmdline.system_hide_hotkey, "ctrl+h");
+        assert_eq!(cmdline.system_hide_others_hotkey, "ctrl+alt+h");
+        assert_eq!(cmdline.system_quit_hotkey, "ctrl+q");
+        assert_eq!(cmdline.system_minimize_hotkey, "ctrl+m");
+        assert_eq!(cmdline.system_fullscreen_hotkey, "ctrl+shift+f");
+        assert_eq!(cmdline.system_show_all_tabs_hotkey, "ctrl+shift+e");
     }
 
     #[test]

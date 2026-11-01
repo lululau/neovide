@@ -1,34 +1,50 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
 
-use skia_safe::{
-    Color4f, FontMgr, Paint, Point, Rect, Size,
-    canvas::{Canvas, SaveLayerRec},
-    colors::{BLACK, WHITE},
-    textlayout::{
-        FontCollection, Paragraph, ParagraphBuilder, ParagraphStyle, TextHeightBehavior, TextIndex,
-        TextStyle,
-    },
-};
+use skia_safe::Color4f;
+use skia_safe::FontMgr;
+use skia_safe::Paint;
+use skia_safe::Point;
+use skia_safe::Rect;
+use skia_safe::Size;
+use skia_safe::canvas::Canvas;
+use skia_safe::canvas::SaveLayerRec;
+use skia_safe::colors::BLACK;
+use skia_safe::colors::WHITE;
+use skia_safe::textlayout::FontCollection;
+use skia_safe::textlayout::Paragraph;
+use skia_safe::textlayout::ParagraphBuilder;
+use skia_safe::textlayout::ParagraphStyle;
+use skia_safe::textlayout::TextHeightBehavior;
+use skia_safe::textlayout::TextIndex;
+use skia_safe::textlayout::TextStyle;
+use strum::EnumCount;
+use strum::EnumIter;
 use strum::IntoEnumIterator;
-use strum::{EnumCount, EnumIter};
-use winit::{
-    application::ApplicationHandler,
-    dpi::PhysicalSize,
-    event::{ElementState, KeyEvent, Modifiers, MouseScrollDelta, WindowEvent},
-    event_loop::{ActiveEventLoop, EventLoop},
-    keyboard::{Key, NamedKey},
-    window::Window,
-};
-
-use crate::{
-    clipboard::{Clipboard, ClipboardHandle},
-    cmd_line::{CmdLineSettings, SRGB_DEFAULT},
-    renderer::{SkiaRenderer, WindowConfig, build_window_config, create_skia_renderer},
-    settings::Settings,
-    window::load_icon,
-};
+use winit::application::ApplicationHandler;
+use winit::dpi::PhysicalSize;
+use winit::event::ElementState;
+use winit::event::KeyEvent;
+use winit::event::Modifiers;
+use winit::event::MouseScrollDelta;
+use winit::event::WindowEvent;
+use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::EventLoop;
+use winit::keyboard::Key;
+use winit::keyboard::NamedKey;
+use winit::window::Window;
 
 use super::EventPayload;
+use crate::clipboard::Clipboard;
+use crate::clipboard::ClipboardHandle;
+use crate::cmd_line::CmdLineSettings;
+use crate::cmd_line::SRGB_DEFAULT;
+use crate::renderer::SkiaRenderer;
+use crate::renderer::WindowConfig;
+use crate::renderer::build_window_config;
+use crate::renderer::create_skia_renderer;
+use crate::settings::Settings;
+use crate::window::load_icon;
 
 const TEXT_COLOR: Color4f = WHITE;
 const BACKGROUND_COLOR: Color4f = BLACK;
@@ -112,16 +128,16 @@ impl ApplicationHandler<EventPayload> for ErrorWindow<'_> {
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.is_none() {
-            if let Some(clipboard) = self.clipboard.as_ref() {
-                let window_config = create_error_window(event_loop, &self.settings);
-                self.state = Some(State::new(
-                    self.message,
-                    window_config,
-                    self.settings.clone(),
-                    ClipboardHandle::new(clipboard),
-                ));
-            }
+        if self.state.is_none()
+            && let Some(clipboard) = self.clipboard.as_ref()
+        {
+            let window_config = create_error_window(event_loop, &self.settings);
+            self.state = Some(State::new(
+                self.message,
+                window_config,
+                self.settings.clone(),
+                ClipboardHandle::new(clipboard),
+            ));
         }
     }
 
@@ -167,9 +183,7 @@ impl State {
         }
     }
 
-    pub fn window_id(&self) -> winit::window::WindowId {
-        self.skia_renderer.window().id()
-    }
+    pub fn window_id(&self) -> winit::window::WindowId { self.skia_renderer.window().id() }
 
     pub fn handle_window_event(&mut self, event: WindowEvent, message: &str) {
         match event {
@@ -188,10 +202,10 @@ impl State {
                 self.paragraphs =
                     create_paragraphs(message, scale_factor as f32, &self.font_collection);
             }
-            WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => {
-                if self.handle_keyboard_input(event, message) {
-                    self.skia_renderer.window().request_redraw();
-                }
+            WindowEvent::KeyboardInput { event, is_synthetic: false, .. }
+                if self.handle_keyboard_input(&event, message) =>
+            {
+                self.skia_renderer.window().request_redraw();
             }
             WindowEvent::MouseWheel { delta: MouseScrollDelta::LineDelta(_, y), .. } => {
                 self.mouse_scroll_accumulator += y * 3.0;
@@ -227,11 +241,15 @@ impl State {
 
         canvas.restore();
 
-        self.skia_renderer.flush();
+        if let Err(error) = self.skia_renderer.flush() {
+            log::error!("Failed to flush error window: {error}");
+            return;
+        }
+
         self.skia_renderer.swap_buffers();
     }
 
-    fn handle_keyboard_input(&mut self, event: KeyEvent, message: &str) -> bool {
+    fn handle_keyboard_input(&mut self, event: &KeyEvent, message: &str) -> bool {
         if event.state != ElementState::Pressed {
             return false;
         }
@@ -265,10 +283,10 @@ impl State {
                         true
                     }
                     "y" => {
-                        if let Some(handle) = self.clipboard.upgrade() {
-                            if let Ok(mut clipboard) = handle.lock() {
-                                let _ = clipboard.set_contents(message.to_string(), "+");
-                            }
+                        if let Some(handle) = self.clipboard.upgrade()
+                            && let Ok(mut clipboard) = handle.lock()
+                        {
+                            let _ = clipboard.set_contents(message.to_string(), "+");
                         }
                         true
                     }
@@ -300,7 +318,7 @@ impl State {
             return true;
         }
 
-        match event.logical_key {
+        match &event.logical_key {
             // NOTE: These work regardless of the ctrl state, mimicking "less"
             Key::Character(c) => match c.as_str() {
                 "k" => self.scroll_line(-1),

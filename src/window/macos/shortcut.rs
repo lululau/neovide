@@ -1,52 +1,15 @@
 use log::warn;
-use winit::{
-    event::{ElementState, KeyEvent, Modifiers},
-    keyboard::{Key, NamedKey},
-};
+use objc2::rc::Retained;
+use objc2_app_kit::NSEvent;
+use objc2_app_kit::NSEventModifierFlags;
+use objc2_foundation::NSString;
+use winit::event::KeyEvent;
+use winit::event::Modifiers;
+use winit::keyboard::Key;
+use winit::keyboard::NamedKey;
 
-use crate::{CmdLineSettings, settings::Settings};
-
-#[derive(Clone, Copy)]
-pub(crate) enum TabNavigationAction {
-    Next,
-    Previous,
-}
-
-#[derive(Clone)]
-pub(crate) struct TabNavigationHotkeys {
-    next: Option<KeyCombo>,
-    prev: Option<KeyCombo>,
-}
-
-impl TabNavigationHotkeys {
-    pub(crate) fn new(settings: &Settings) -> Self {
-        let cmdline = settings.get::<CmdLineSettings>();
-        Self {
-            next: KeyCombo::parse(&cmdline.system_tab_next_hotkey),
-            prev: KeyCombo::parse(&cmdline.system_tab_prev_hotkey),
-        }
-    }
-
-    pub(crate) fn action_for(
-        &self,
-        event: &KeyEvent,
-        modifiers: &Modifiers,
-    ) -> Option<TabNavigationAction> {
-        match event.state {
-            ElementState::Pressed => [
-                (TabNavigationAction::Next, self.next.as_ref()),
-                (TabNavigationAction::Previous, self.prev.as_ref()),
-            ]
-            .into_iter()
-            .find(|(_, combo)| combo.is_some_and(|combo| combo.matches(event, modifiers)))
-            .map(|(action, _)| action),
-            ElementState::Released => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct KeyCombo {
+#[derive(Debug, Clone, Copy)]
+pub struct KeyCombo {
     command: bool,
     control: bool,
     option: bool,
@@ -55,7 +18,7 @@ struct KeyCombo {
 }
 
 impl KeyCombo {
-    fn parse(raw: &str) -> Option<Self> {
+    pub fn parse(raw: &str) -> Option<Self> {
         let trimmed = raw.trim();
         if trimmed.is_empty() || is_disabled_keyword(trimmed) {
             return None;
@@ -70,6 +33,41 @@ impl KeyCombo {
                 Some(state)
             })?
             .build(raw)
+    }
+
+    pub fn to_modifiers(self) -> NSEventModifierFlags {
+        let mut flags = NSEventModifierFlags::empty();
+
+        if self.command {
+            flags |= NSEventModifierFlags::Command;
+        }
+
+        if self.control {
+            flags |= NSEventModifierFlags::Control;
+        }
+
+        if self.option {
+            flags |= NSEventModifierFlags::Option;
+        }
+
+        if self.shift {
+            flags |= NSEventModifierFlags::Shift;
+        }
+
+        flags
+    }
+
+    /// Constructs an `NSString` representing the key component of this combo, if it's a character
+    /// key. Named keys will return `None`.
+    pub fn to_key(self) -> Option<Retained<NSString>> {
+        match self.key {
+            KeyMatch::Char(character) => Some(NSString::from_str(&character.to_string())),
+            KeyMatch::Named(_named) => {
+                // TODO: Figure out how to represent named keys in a way that can be used with
+                // NSEvent. For now, we don't support this.
+                None
+            }
+        }
     }
 
     fn matches(&self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
@@ -87,10 +85,38 @@ impl KeyCombo {
         }
     }
 
+    pub fn matches_key_event(&self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
+        self.matches(event, modifiers)
+    }
+
+    pub fn matches_nsevent(&self, event: &NSEvent) -> bool {
+        if !self.nsevent_modifiers_match(event.modifierFlags()) {
+            return false;
+        }
+
+        match self.key {
+            KeyMatch::Char(expected) => event
+                .charactersIgnoringModifiers()
+                .and_then(|characters| characters.to_string().chars().next())
+                .is_some_and(|pressed| expected.eq_ignore_ascii_case(&pressed)),
+            KeyMatch::Named(_) => false,
+        }
+    }
+
     fn modifiers_match(&self, modifiers: &Modifiers) -> bool {
         let state = modifiers.state();
         (self.command, self.control, self.option, self.shift)
             == (state.super_key(), state.control_key(), state.alt_key(), state.shift_key())
+    }
+
+    fn nsevent_modifiers_match(&self, flags: NSEventModifierFlags) -> bool {
+        (self.command, self.control, self.option, self.shift)
+            == (
+                flags.contains(NSEventModifierFlags::Command),
+                flags.contains(NSEventModifierFlags::Control),
+                flags.contains(NSEventModifierFlags::Option),
+                flags.contains(NSEventModifierFlags::Shift),
+            )
     }
 }
 
@@ -121,15 +147,12 @@ fn parse_token(value: &str, raw: &str) -> Option<ParsedToken> {
 fn parse_character_key(value: &str, raw: &str) -> Option<char> {
     let mut chars = value.chars();
     let Some(ch) = chars.next() else {
-        warn!("macOS tab navigation shortcut '{}' has no key; ignoring", raw);
+        warn!("macOS shortcut '{}' has no key; ignoring", raw);
         return None;
     };
 
     if chars.next().is_some() {
-        warn!(
-            "macOS tab navigation shortcut '{}' must end with a single character key; ignoring",
-            raw
-        );
+        warn!("macOS shortcut '{}' must end with a single character key; ignoring", raw);
         return None;
     }
 
@@ -166,7 +189,7 @@ impl ParseState {
     fn set_key(&mut self, value: KeyMatch, raw: &str) -> Option<()> {
         match self.key {
             Some(_) => {
-                warn!("macOS tab navigation shortcut '{}' has multiple keys; ignoring", raw);
+                warn!("macOS shortcut '{}' has multiple keys; ignoring", raw);
                 None
             }
             None => {
@@ -183,21 +206,16 @@ impl ParseState {
             option: self.option,
             shift: self.shift,
             key: self.key.or_else(|| {
-                warn!(
-                    "macOS tab navigation shortcut '{}' is missing a key component; ignoring",
-                    raw
-                );
+                warn!("macOS shortcut '{}' is missing a key component; ignoring", raw);
                 None
             })?,
         })
     }
 }
 
-fn is_disabled_keyword(value: &str) -> bool {
-    value.trim().eq_ignore_ascii_case("false")
-}
+fn is_disabled_keyword(value: &str) -> bool { value.trim().eq_ignore_ascii_case("false") }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum KeyMatch {
     Char(char),
     Named(NamedKey),
