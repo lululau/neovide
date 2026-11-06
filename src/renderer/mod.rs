@@ -76,6 +76,7 @@ use crate::profiling::tracy_zone;
 use crate::renderer::fonts::font_options::PixelGeometry;
 use crate::renderer::rendered_layer::FloatingLayer;
 use crate::renderer::rendered_layer::group_windows;
+use crate::renderer::rendered_window::BASE_GRID_ID;
 use crate::settings::*;
 use crate::units::GridPos;
 use crate::units::GridRect;
@@ -116,6 +117,7 @@ pub struct RendererSettings {
     position_animation_length: f32,
     scroll_animation_length: f32,
     scroll_animation_far_lines: u32,
+    fill_bottom_background: bool,
     floating_blur: bool,
     floating_blur_amount_x: f32,
     floating_blur_amount_y: f32,
@@ -139,6 +141,7 @@ impl Default for RendererSettings {
             position_animation_length: 0.15,
             scroll_animation_length: 0.3,
             scroll_animation_far_lines: 1,
+            fill_bottom_background: false,
             floating_blur: true,
             floating_blur_amount_x: 2.0,
             floating_blur_amount_y: 2.0,
@@ -290,7 +293,15 @@ impl Renderer {
         let default_background = self.grid_renderer.get_default_background(opacity);
         let grid_scale = self.grid_renderer.grid_scale;
 
-        let layer_grouping = self.settings.get::<RendererSettings>().experimental_layer_grouping;
+        let settings = self.settings.get::<RendererSettings>();
+        let layer_grouping = settings.experimental_layer_grouping;
+
+        // only the remainder below the main grid is available for bottom
+        // filling. A popup can be bottommost in its layer while another
+        // layer still owns the rows below it. None disables expansion when
+        // the setting is off or the main grid is not available yet.
+        let bottom_fill_y = self.bottom_fill_y(settings.fill_bottom_background, grid_scale);
+
         root_canvas.clear(default_background);
         root_canvas.save();
         root_canvas.reset_matrix();
@@ -366,22 +377,23 @@ impl Renderer {
             (root_windows, floating_layers)
         };
 
-        let settings = self.settings.get::<RendererSettings>();
         let max_root_x = max_window_max_x(&root_windows, grid_scale);
-        let max_root_y = max_window_max_y(&root_windows, grid_scale);
         let root_window_regions = root_windows
             .into_iter()
             .map(|window| {
                 let region = window.pixel_region(grid_scale);
                 let rightmost_root_window = is_rightmost_window_edge(region.max.x, max_root_x);
-                let bottommost_root_window = is_bottommost_window_edge(region.max.y, max_root_y);
+
+                // The toggle gates expansion before drawing. Draw also
+                // returns that region for mouse hit testing, so skipping
+                // only the paint would leave an invisible hit area.
                 window.draw(
                     root_canvas,
                     default_background,
                     grid_scale,
                     Some(*content_region),
                     rightmost_root_window,
-                    bottommost_root_window,
+                    bottom_fill_y,
                 )
             })
             .collect_vec();
@@ -395,6 +407,7 @@ impl Renderer {
                     default_background,
                     grid_scale,
                     Some(*content_region),
+                    bottom_fill_y,
                 )
             })
             .collect_vec();
@@ -415,6 +428,15 @@ impl Renderer {
 
         #[cfg(feature = "profiling")]
         plot_skia_cache();
+    }
+
+    fn bottom_fill_y(&self, enabled: bool, grid_scale: GridScale) -> Option<f32> {
+        let main_grid = self.rendered_windows.get(&BASE_GRID_ID)?;
+        if !enabled || main_grid.hidden || main_grid.grid_size.height == 0 {
+            return None;
+        }
+
+        Some(main_grid.pixel_region(grid_scale).max.y)
     }
 
     fn message_selection_window(&self) -> Option<(&MessageSelection, &RenderedWindow)> {
@@ -740,21 +762,10 @@ pub fn is_rightmost_window_edge(region_max_x: f32, max_x: f32) -> bool {
     max_x.is_finite() && (region_max_x - max_x).abs() <= f32::EPSILON
 }
 
-pub fn is_bottommost_window_edge(region_max_y: f32, max_y: f32) -> bool {
-    max_y.is_finite() && (region_max_y - max_y).abs() <= f32::EPSILON
-}
-
 pub fn max_window_max_x(windows: &[&mut RenderedWindow], grid_scale: GridScale) -> f32 {
     windows.iter().fold(f32::NEG_INFINITY, |max_x, window| {
         let region = window.pixel_region(grid_scale);
         max_x.max(region.max.x)
-    })
-}
-
-pub fn max_window_max_y(windows: &[&mut RenderedWindow], grid_scale: GridScale) -> f32 {
-    windows.iter().fold(f32::NEG_INFINITY, |max_y, window| {
-        let region = window.pixel_region(grid_scale);
-        max_y.max(region.max.y)
     })
 }
 
@@ -874,6 +885,129 @@ mod tests {
 
     fn startup_message(content: &str) -> StartupMessage {
         StartupMessage { kind: MessageKind::Error, content: content.to_string() }
+    }
+
+    /// A positioned root grid with spare space below and to the right. Each
+    /// test gets its own renderer and raster surface. Line pictures are
+    /// left empty, so the assertions check the returned geometry without
+    /// verifying background colors. Drawing again on the same fixture
+    /// checks that settings are read again without recreating the window.
+    struct RootWindowFixture {
+        renderer: Renderer,
+        surface: skia_safe::Surface,
+        grid_region: PixelRect<f32>,
+        content_region: PixelRect<f32>,
+    }
+
+    impl RootWindowFixture {
+        fn new() -> Self {
+            let mut renderer = create_renderer();
+            renderer.settings.register::<cursor_renderer::CursorSettings>();
+            renderer.settings.register::<ProgressBarSettings>();
+            let mut window = RenderedWindow::new(BASE_GRID_ID);
+            window.handle_window_draw_command(WindowDrawCommand::Position {
+                grid_position: (0.0, 0.0),
+                grid_size: (20, 4),
+                anchor_info: None,
+                window_type: WindowType::Editor,
+            });
+
+            let grid_scale = renderer.grid_renderer.grid_scale;
+            let grid_region = window.pixel_region(grid_scale);
+            let content_region = PixelRect::new(
+                grid_region.min,
+                PixelPos::new(
+                    grid_region.max.x + grid_scale.width() / 2.0,
+                    grid_region.max.y + grid_scale.height() / 2.0,
+                ),
+            );
+
+            renderer.rendered_windows.insert(BASE_GRID_ID, window);
+            let surface = skia_safe::surfaces::raster_n32_premul((
+                content_region.max.x.ceil() as i32,
+                content_region.max.y.ceil() as i32,
+            ))
+            .unwrap();
+
+            Self { renderer, surface, grid_region, content_region }
+        }
+
+        fn draw(&mut self) -> PixelRect<f32> {
+            self.renderer.draw_frame(self.surface.canvas(), &self.content_region, 0.0);
+            self.renderer.window_regions[0].region
+        }
+    }
+
+    #[test]
+    fn root_window_expands_bottom_and_right_edges_when_bottom_fill_is_enabled() {
+        let mut fixture = RootWindowFixture::new();
+        let mut settings = fixture.renderer.settings.get::<RendererSettings>();
+        settings.fill_bottom_background = true;
+        fixture.renderer.settings.set(&settings);
+
+        let region = fixture.draw();
+
+        assert_eq!(region, fixture.content_region);
+    }
+
+    #[test]
+    fn root_window_expands_only_right_edge_by_default() {
+        let mut fixture = RootWindowFixture::new();
+        assert!(!fixture.renderer.settings.get::<RendererSettings>().fill_bottom_background);
+
+        let region = fixture.draw();
+
+        assert_eq!(
+            region,
+            PixelRect::new(
+                fixture.grid_region.min,
+                PixelPos::new(fixture.content_region.max.x, fixture.grid_region.max.y),
+            )
+        );
+    }
+
+    #[test]
+    fn root_window_restores_bottom_fill_when_reenabled() {
+        let mut fixture = RootWindowFixture::new();
+        let mut settings = fixture.renderer.settings.get::<RendererSettings>();
+        settings.fill_bottom_background = true;
+        fixture.renderer.settings.set(&settings);
+        assert_eq!(fixture.draw(), fixture.content_region);
+
+        settings.fill_bottom_background = false;
+        fixture.renderer.settings.set(&settings);
+        assert_eq!(
+            fixture.draw(),
+            PixelRect::new(
+                fixture.grid_region.min,
+                PixelPos::new(fixture.content_region.max.x, fixture.grid_region.max.y),
+            )
+        );
+
+        settings.fill_bottom_background = true;
+        fixture.renderer.settings.set(&settings);
+        assert_eq!(fixture.draw(), fixture.content_region);
+    }
+
+    #[test]
+    fn root_window_does_not_fill_bottom_without_main_grid() {
+        let mut fixture = RootWindowFixture::new();
+        let mut settings = fixture.renderer.settings.get::<RendererSettings>();
+        settings.fill_bottom_background = true;
+        fixture.renderer.settings.set(&settings);
+        let mut window = fixture.renderer.rendered_windows.remove(&BASE_GRID_ID).unwrap();
+        window.id = 2;
+        fixture.renderer.rendered_windows.insert(window.id, window);
+
+        let region = fixture.draw();
+
+        assert_eq!(
+            region,
+            PixelRect::new(
+                fixture.grid_region.min,
+                PixelPos::new(fixture.content_region.max.x, fixture.grid_region.max.y),
+            )
+        );
     }
 
     #[test]
